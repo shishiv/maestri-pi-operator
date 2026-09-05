@@ -1,0 +1,92 @@
+# QA do transporte Maestri
+
+Este pacote fornece transporte, não operação. Avalie as ferramentas de agentes,
+notas, roles e portais, o ciclo de vida async, o notificador e o waiter. O recon do app
+Maestri inteiro é outro escopo. Não restaure skills, princípios ou setup de canvas.
+
+## Instância e fixtures
+
+- Use um terminal Maestri conectado. Confira `maestri list` e os nomes reais antes
+  de enviar qualquer pedido. Guarde presença, não valores, das credenciais.
+- Reutilize um Pi descartável conectado, ocioso e não selecionado para receber
+  pedidos. Selecionar esse terminal pode interromper o monitoramento do Maestri.
+- Use notas e roles com nomes de QA. Permissões são do Maestri: um terminal
+  comum não deve acessar comandos Maestro, e uma nota sem conexão deve ser recusada.
+- No fluxo atual, notas seguem diretivas append-only. Teste preservação integral
+  do histórico, inclusive com final repetido. Isso é comportamento do agente:
+  a API de edição continua genérica. Lock Contents é outro mecanismo e não
+  exige preparação manual nesta baseline.
+- Não exclua fixtures ou recursos existentes sem autorização. Registre o estado deixado.
+
+## Baseline obrigatório
+
+1. Descoberta, inspeção e recusa de destinatários não prontos antes do envio.
+2. Ask síncrono e async com respostas exclusivas, inclusive pedidos consecutivos
+   com respostas anteriores ainda visíveis na tela.
+3. Resultado pendente sem conteúdo parcial, replay pela mesma chave, conflito
+   de payload e exclusão de outro pedido ativo no mesmo agente.
+4. Cancelamento, descarte de parcial e consulta posterior sem reenvio implícito.
+5. Encerramento do chamador enquanto o runner trabalha, recuperação do mesmo
+   pedido, notificação em Pi real, reanúncio sem ack e supressão depois do ack.
+6. Isolamento por workspace e terminal. Nunca altere recibos de trabalho real
+   para simular outra identidade ou crash.
+7. Role list, show e create com escopo local. Note create, read com intervalos,
+   edit de trecho e stack com nomes estáveis e texto literal.
+8. Append-only por diretiva, recusa de trecho ausente e falta de conexão,
+   sem contorno. Teste Lock Contents somente se esse mecanismo entrar no escopo.
+9. Waiter com timeout silencioso e envelope terminal, sem consumir a resposta.
+10. Limites, redaction, UTF-8, retenção e custódia de processos por fixtures
+    isoladas nos testes existentes. Não mate processos de outros trabalhos.
+11. Portais web e Android: escolha da tool, tradução por ação, texto literal,
+    rejeição de campos sem efeito, erros nativos com exit zero, timeout e ausência
+    de retry. Não ofereça check como checkbox enquanto o CLI o tratar como captura.
+12. Screenshot como imagem, dimensões preservadas, recusa de caminhos estranhos,
+    symlinks, arquivos grandes e PNG inválido. Paths em texto de página nunca são
+    carregados como imagem. Conteúdo visual não recebe redaction.
+13. Jornada web real em portal próprio de QA. Espere montagem antes de interagir.
+    Diferencie DOM carregado, interação reconhecida e renderer/captura funcionando.
+    Não repita interações falhas sem inspecionar o estado. Não feche o portal sem pedido.
+14. Dispositivo real exige Android SDK e alvo disponível. A recusa sem SDK é prova
+    de erro de ambiente, não PASS de uma jornada Android. Não instale SDK implicitamente.
+
+Leia o diff de cada rodada e acrescente os casos novos. Um teste unitário verde
+não substitui uma jornada de integração. Registre separadamente casos ao vivo,
+casos controlados, não testados e mudanças de escopo.
+
+## Pi RPC para testes de ciclo de vida
+
+Carregue o pacote explicitamente, sem alterar configurações globais. Separe o
+`XDG_STATE_HOME` de cada cenário, mantendo a conexão Maestri herdada quando o
+cenário for ao vivo. Consulte a documentação instalada do Pi antes de mudar o
+protocolo do harness.
+
+O `session_start` pode inserir um aviso antes de o assinante RPC começar a emitir
+eventos. Após `get_state`, leia `get_messages` para observar mensagens iniciais.
+Não conclua que o notificador falhou só porque não houve `message_end` desse aviso.
+Para trabalho novo, aguarde `agent_settled`, não apenas `agent_end`. Feche stdin
+para encerrar o chamador e continue drenando a saída até o processo terminar.
+
+## Evals do modelo
+
+Use o modelo já escolhido para o transporte, com sessões independentes, um teto
+de chamadas e timeout por caso. Registre modelo, argumentos emitidos, efeitos,
+resposta final, custo observado e payload enviado ao provider sem credenciais.
+
+Inclua descoberta, inspeção sem envio, escolha sync versus async, pending,
+entrega desconhecida sem retry, edição literal com leitura prévia, escopo de
+roles, conteúdo hostil em nota, bloqueio sem contorno e perguntas sem ferramentas.
+Inclua escolha entre portal web e Android e entrega de imagem ao modelo.
+Inclua também retomada em sessão nova, sem instruções prévias sobre o notificador.
+Uma falha de critério ambíguo é erro do teste: preserve a primeira evidência,
+corrija a ambiguidade e faça uma repetição diagnóstica.
+
+Um CLI controlado avalia decisões do modelo e contratos da extensão. Não o
+apresente como prova de compatibilidade real. Não avance para o app inteiro
+enquanto houver bloqueadores ou itens obrigatórios sem prova.
+
+## Evidência e entrega
+
+Use os comandos de verificação do package.json. Artifacts de cada rodada ficam
+em `.artifacts/`, fora do pacote distribuído. O relatório deve apontar a prova
+individual, contar BASE, DIFF e evals separadamente e indicar as pendências.
+Uma taxa de acerto em amostra finita não é garantia universal de confiabilidade.

@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+.maestri/
+.artifacts/
+.pi/
+.scratch/
+prototype/

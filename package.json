@@ -1,0 +1,50 @@
+{
+  "name": "maestri-pi-operator",
+  "version": "0.3.0",
+  "description": "Native Maestri transport tools for Pi.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "bin": {
+    "mpo-extension": "./bin/mpo-extension"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./readiness": "./src/readiness.ts"
+  },
+  "files": [
+    "README.md",
+    "bin",
+    "docs",
+    "firstmate-extension.json",
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "smoke": "bash tests/smoke-v01.sh --fake",
+    "smoke:live": "bash tests/smoke-v01.sh --live"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^24.0.0",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  }
+}
