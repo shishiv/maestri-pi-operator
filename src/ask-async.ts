@@ -111,10 +111,20 @@ export function assertReadyPiScreen(screen: string): void {
 		max_age_ms: 0,
 	});
 	if (readiness.verdict === "busy") {
-		throw new Error("The target Pi is busy; no async request was launched");
+		throw new PreflightError("The target Pi is busy; no async request was launched", "busy");
 	}
 	if (readiness.verdict !== "ready") {
-		throw new Error("The target is missing, ambiguous, or not a ready Pi; no async request was launched");
+		throw new PreflightError("The target is missing, ambiguous, or not a ready Pi; no async request was launched", readiness.verdict === "unsupported" ? readiness.reason : readiness.verdict);
+	}
+}
+
+export class PreflightError extends Error {
+	readonly preflight: { stage: "readiness"; reason: string; request_created: false };
+
+	constructor(message: string, reason: string) {
+		super(message);
+		this.name = "PreflightError";
+		this.preflight = { stage: "readiness", reason: reason.replace(/[^a-z0-9-]/gi, "").slice(0, 64) || "unknown", request_created: false };
 	}
 }
 
@@ -171,7 +181,7 @@ async function preflightReady(
 		maxOutputBytes: MAESTRI_RAW_OUTPUT_MAX_BYTES,
 	});
 	if (result.killed || result.code !== 0) {
-		throw new Error("Maestri readiness check failed; no async request was launched");
+		throw new PreflightError("Maestri readiness check failed; no async request was launched", "check-failed");
 	}
 	assertReadyPiScreen(result.stdout);
 }
