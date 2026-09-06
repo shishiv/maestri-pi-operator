@@ -21,7 +21,7 @@ export type AskPhase = "accepted" | "running" | "terminal";
 export type AskDelivery = "not-attempted" | "unknown" | "confirmed";
 export type AskReply = "none" | "pending" | "received" | "cancelled" | "unknown";
 export type AskCustody = "none" | "held" | "orphan" | "released";
-export type AskNotificationState = "none" | "pending" | "sent" | "acked";
+export type AskNotificationState = "none" | "pending" | "dispatching" | "sent" | "acked";
 
 export interface ProcessIdentity {
 	start_time: string;
@@ -289,7 +289,7 @@ function parseRecord(value: unknown): AskRequestRecord {
 		!["none", "held", "orphan", "released"].includes(record.custody ?? "") ||
 		(record.cleanup_deadline_ms !== null && typeof record.cleanup_deadline_ms !== "number") ||
 		(record.custody_reason !== undefined && !isString(record.custody_reason)) ||
-		!record.notification || !["none", "pending", "sent", "acked"].includes(record.notification.state) ||
+		!record.notification || !["none", "pending", "dispatching", "sent", "acked"].includes(record.notification.state) ||
 		(record.notification.digest !== null && !/^sha256:[0-9a-f]{64}$/.test(record.notification.digest)) ||
 		(record.notification.sent_at !== null && !isString(record.notification.sent_at)) ||
 		!Number.isSafeInteger(record.notification.attempts) || record.notification.attempts < 0 ||

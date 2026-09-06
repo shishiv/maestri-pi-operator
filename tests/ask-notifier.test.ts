@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -375,4 +376,29 @@ test("a synchronous send failure releases its claim and retries on the next idle
 	assert.equal(sent.notification.state, "sent");
 	assert.equal(sent.notification.attempts, 2);
 	assert.equal(flaky.messages.length, 1);
+});
+
+test("a post-send journal failure does not reannounce after restart", async (t) => {
+	const { env, root } = await fixture(t);
+	const completed = await terminal(root);
+	const unavailable = `${root}-unavailable`;
+	const first = fakePi(false, () => {
+		renameSync(root, unavailable);
+		writeFileSync(root, "unavailable");
+	});
+	const ctx = { isIdle: () => true, hasUI: true, ui: { notify() {} } };
+	registerAskNotifier(first.pi, notifierOptions(env, owner(403), () => {}));
+	t.after(() => first.emit("session_shutdown", ctx));
+
+	await first.emit("session_start", ctx);
+	rmSync(root);
+	renameSync(unavailable, root);
+	assert.equal(first.messages.length, 1);
+	assert.equal((await readRequest(root, completed.request_id)).notification.state, "dispatching");
+
+	const restarted = fakePi();
+	registerAskNotifier(restarted.pi, notifierOptions(env, owner(404), () => {}));
+	t.after(() => restarted.emit("session_shutdown", ctx));
+	await restarted.emit("session_start", ctx);
+	assert.equal(restarted.messages.length, 0);
 });

@@ -80,7 +80,7 @@ class AskNotifier {
 		try {
 			for (const record of (await listRequests(this.root)).slice(0, 256)) {
 				if (this.stopped || !this.ctx.isIdle()) return;
-				if (record.phase !== "terminal" || record.notification.state === "acked") continue;
+				if (record.phase !== "terminal" || record.notification.state === "acked" || record.notification.state === "dispatching") continue;
 				const key = `${record.request_id}:${terminalEnvelope(record).digest}`;
 				if (this.attempted.has(key)) continue;
 				const claimed = await this.claim(record.request_id);
@@ -88,6 +88,11 @@ class AskNotifier {
 				// Lock/identity IO can outlive idle or session shutdown. A claim is not a send.
 				if (this.stopped || !this.ctx.isIdle()) return;
 				const envelope = terminalEnvelope(claimed);
+				await this.markDispatching(claimed.request_id, envelope.digest);
+				if (this.stopped || !this.ctx.isIdle()) {
+					await this.markFailed(claimed.request_id, envelope.digest);
+					continue;
+				}
 				this.attempted.add(`${claimed.request_id}:${envelope.digest}`);
 				try {
 					this.pi.sendMessage({
@@ -143,7 +148,7 @@ class AskNotifier {
 	private async claim(requestId: string) {
 		return withRequestLock(this.root, requestId, async () => {
 			const record = await readRequest(this.root, requestId);
-			if (record.phase !== "terminal" || record.notification.state === "acked") return null;
+			if (record.phase !== "terminal" || record.notification.state === "acked" || record.notification.state === "dispatching") return null;
 			const digest = terminalEnvelope(record).digest;
 			const claim = record.notification.claim;
 			if (claim && (claim.pid !== this.owner.pid || !sameIdentity(claim.identity, this.owner.identity))) {
@@ -165,6 +170,20 @@ class AskNotifier {
 			};
 			await atomicWriteRecord(this.root, claimed);
 			return claimed;
+		});
+	}
+
+	private async markDispatching(requestId: string, digest: string): Promise<void> {
+		await withRequestLock(this.root, requestId, async () => {
+			const record = await readRequest(this.root, requestId);
+			if (record.notification.state === "acked" || record.notification.digest !== digest) return;
+			await atomicWriteRecord(this.root, {
+				...record,
+				notification: {
+					...record.notification,
+					state: "dispatching",
+				},
+			});
 		});
 	}
 
