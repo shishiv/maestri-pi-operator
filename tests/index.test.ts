@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import maestriPiOperator from "../src/index.ts";
 
 type Environment = Readonly<Record<string, string | undefined>>;
@@ -10,15 +9,18 @@ const contextKeys = ["MAESTRI_WORKSPACE_ID", "MAESTRI_SOCKET", "MAESTRI_TERMINAL
 
 function loadExtension(env: Environment) {
 	const tools: string[] = [];
+	const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
+	const messages: Array<{ message: { content: string; customType: string; details: { digest: string } }; options: unknown }> = [];
 	const handlers = new Map<string, RegisteredHandler[]>();
 	const pi = {
 		registerTool(tool: { name: string }) { tools.push(tool.name); },
+		registerCommand(name: string, command: { handler(args: string, ctx: unknown): Promise<void> }) { commands.set(name, command); },
 		on(name: string, handler: RegisteredHandler) {
 			const entries = handlers.get(name) ?? [];
 			entries.push(handler);
 			handlers.set(name, entries);
 		},
-		sendMessage() {},
+		sendMessage(message: { content: string; customType: string; details: { digest: string } }, options: unknown) { messages.push({ message, options }); },
 	} as unknown as ExtensionAPI;
 	const previous = Object.fromEntries(contextKeys.map((key) => [key, process.env[key]]));
 	try {
@@ -35,28 +37,10 @@ function loadExtension(env: Environment) {
 			else process.env[key] = value;
 		}
 	}
-	return { handlers, tools };
+	return { commands, handlers, messages, tools };
 }
 
-async function withEnvironment<T>(env: Environment, action: () => Promise<T> | T): Promise<T> {
-	const previous = Object.fromEntries(contextKeys.map((key) => [key, process.env[key]]));
-	try {
-		for (const key of contextKeys) {
-			const value = env[key];
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-		return await action();
-	} finally {
-		for (const key of contextKeys) {
-			const value = previous[key];
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-	}
-}
-
-test("exposes no Maestri tools, hooks, or skills without a complete Maestri context", () => {
+test("exposes no Maestri tools, hooks, or command without a complete Maestri context", () => {
 	for (const env of [
 		{},
 		{ MAESTRI_WORKSPACE_ID: "workspace" },
@@ -65,10 +49,11 @@ test("exposes no Maestri tools, hooks, or skills without a complete Maestri cont
 		const loaded = loadExtension(env);
 		assert.deepEqual(loaded.tools, []);
 		assert.deepEqual([...loaded.handlers], []);
+		assert.deepEqual([...loaded.commands], []);
 	}
 });
 
-test("exposes all transport tools and bundled skills inside Maestri", async () => {
+test("exposes 14 transport tools, one command, and four hooks inside Maestri", () => {
 	const env = {
 		MAESTRI_WORKSPACE_ID: "workspace",
 		MAESTRI_SOCKET: "/tmp/maestri.sock",
@@ -80,15 +65,28 @@ test("exposes all transport tools and bundled skills inside Maestri", async () =
 		"maestri_note_create", "maestri_note_edit", "maestri_note_read", "maestri_note_stack",
 		"maestri_portal", "maestri_portal_device", "maestri_role_create", "maestri_role_list", "maestri_role_show",
 	].sort());
-	const resourceHandlers = loaded.handlers.get("resources_discover") ?? [];
-	assert.equal(resourceHandlers.length, 1);
-	const resources = await withEnvironment(env, () => resourceHandlers[0]({ type: "resources_discover", cwd: "/tmp", reason: "startup" }, {}));
-	assert.ok(resources && typeof resources === "object" && "skillPaths" in resources);
-	const skillPaths = (resources as { skillPaths: string[] }).skillPaths;
-	assert.equal(skillPaths.length, 1);
-	const discovered = loadSkillsFromDir({ dir: skillPaths[0], source: "path" });
-	assert.deepEqual(discovered.diagnostics, []);
-	assert.deepEqual(discovered.skills.map(({ name }) => name).sort(), [
-		"maestri", "maestri-manager", "maestri-portal", "maestri-portal-devices", "maestri-routines", "maestri-workspace",
-	].sort());
+	assert.equal([...loaded.handlers.values()].flat().length, 4);
+	assert.equal(loaded.handlers.has("resources_discover"), false);
+	assert.deepEqual([...loaded.commands.keys()], ["maestri-operator"]);
+});
+
+test("maestri operator queues no-argument guidance and deduplicates it after reload", async () => {
+	const env = { MAESTRI_WORKSPACE_ID: "workspace", MAESTRI_SOCKET: "/tmp/maestri.sock", MAESTRI_TERMINAL_ID: "terminal" };
+	const loaded = loadExtension(env);
+	const notices: string[] = [];
+	const ctx = {
+		sessionManager: { getEntries: () => loaded.messages.map(({ message }) => ({ type: "custom_message", ...message })) },
+		ui: { notify: (message: string) => notices.push(message) },
+	};
+	const command = loaded.commands.get("maestri-operator");
+	assert.ok(command);
+	await command.handler("", ctx);
+	assert.deepEqual(loaded.messages[0].options, { deliverAs: "nextTurn" });
+	assert.equal(loaded.messages[0].message.customType, "mpo.maestri-operator");
+	await command.handler("", ctx);
+	assert.equal(loaded.messages.length, 1);
+	assert.match(notices[0], /already active/);
+	await command.handler("Inspect the connected reviewer", ctx);
+	assert.deepEqual(loaded.messages[1].options, { deliverAs: "followUp", triggerTurn: true });
+	assert.match(loaded.messages[1].message.content, /Task: Inspect the connected reviewer/);
 });

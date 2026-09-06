@@ -37,12 +37,10 @@ test("installed tarball runs its external CLI and durable runner without a TypeS
 	const packed = (await exec("tar", ["-tzf", archive], { env, timeout: 5_000 })).stdout
 		.trim().split("\n").map((entry) => entry.replace(/^package\//, ""));
 	for (const required of [
-		"package.json", "README.md", "bin/mpo-extension", "dist/index.js", "dist/index.d.ts",
+		"package.json", "README.md", "bin/mpo-extension", "dist/index.js", "dist/index.d.ts", "dist/operator-command.js",
 		"dist/ask-runner.mjs", "dist/extension-cli.mjs", "docs/architecture.md", "firstmate-extension.json",
-		"resources/skills/maestri/SKILL.md", "resources/skills/maestri-manager/SKILL.md",
-		"resources/skills/maestri-portal/SKILL.md", "resources/skills/maestri-portal-devices/SKILL.md",
-		"resources/skills/maestri-routines/SKILL.md", "resources/skills/maestri-workspace/SKILL.md",
 	]) assert.ok(packed.includes(required), `missing packed file: ${required}`);
+	assert.ok(packed.every((entry) => !entry.startsWith("resources/skills/")), "bundled skills leaked into the tarball");
 	assert.ok(packed.every((entry) => !/^(?:src|skills|maestri\/roles|\.artifacts)\//.test(entry)), "retired or local sources leaked into the tarball");
 	await exec("npm", ["install", "--offline", "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund", archive], {
 		cwd: consumer, env, timeout: 30_000, maxBuffer: 1024 * 1024,
@@ -91,14 +89,14 @@ const { session } = await createAgentSession({ resourceLoader: loader, sessionMa
 await session.bindExtensions({});
 const result = {
   tools: session.getAllTools().map((tool) => tool.name).filter((name) => name.startsWith("maestri")).sort(),
-  skills: session.resourceLoader.getSkills().skills.map((skill) => skill.name).filter((name) => name.startsWith("maestri")).sort(),
+  commands: session._extensionRunner.getRegisteredCommands().map((command) => command.name).filter((name) => name.startsWith("maestri")).sort(),
 };
 await new Promise((resolve) => process.stdout.write(JSON.stringify(result), resolve));
 process.exit(0);
 `);
 		const probeEnv = { ...env, MPO_INSTALLED_PACKAGE: installed };
 		const outside = JSON.parse((await exec(process.execPath, [script], { cwd: consumer, env: probeEnv, timeout: 5_000 })).stdout);
-		assert.deepEqual(outside, { tools: [], skills: [] });
+		assert.deepEqual(outside, { tools: [], commands: [] });
 		const insideEnv = {
 			...probeEnv,
 			MAESTRI_WORKSPACE_ID: "fixture-workspace",
@@ -107,9 +105,7 @@ process.exit(0);
 		};
 		const inside = JSON.parse((await exec(process.execPath, [script], { cwd: consumer, env: insideEnv, timeout: 5_000 })).stdout);
 		assert.equal(inside.tools.length, 14);
-		assert.deepEqual(inside.skills.sort(), [
-			"maestri", "maestri-manager", "maestri-portal", "maestri-portal-devices", "maestri-routines", "maestri-workspace",
-		].sort());
+		assert.deepEqual(inside.commands, ["maestri-operator"]);
 	});
 
 	await t.test("the installed executable handles a protocol handshake", async () => {
@@ -203,7 +199,7 @@ import { classifyPiReadiness as classifyViaSubpath } from "maestri-pi-operator/r
 const manifestExtension = await import(process.env.MPO_INSTALLED_EXTENSION_URL);
 if (manifestExtension.default !== extension) throw new Error("manifest and public exports resolve different extensions");
 const tools = new Map();
-extension({ registerTool(tool) { tools.set(tool.name, tool); }, on() {}, sendMessage() {} });
+extension({ registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {}, on() {}, sendMessage() {} });
 if (classifyPiReadiness !== classifyViaSubpath) throw new Error("readiness exports disagree");
 const call = (name, params) => tools.get(name).execute("installed", params, undefined, undefined, { cwd: process.cwd() });
 const started = await call("maestri_ask_async", { agent: "Fixture peer", prompt: "reply", client_request_id: "public-entry" });

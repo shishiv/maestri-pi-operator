@@ -7,9 +7,9 @@
 **Your Maestri canvas, available through native Pi tools.**
 
 Talk to connected agents, keep shared notes, inspect browser pages and control
-Android portals without leaving Pi. The package provides **14 typed tools**,
-six Maestri usage skills, durable async replies and screenshots returned as
-images. The extension exposes none of those tools or skills unless both
+Android portals without leaving Pi. The package provides **14 typed tools**, one
+`/maestri-operator` command, durable async replies and screenshots returned as
+images. The extension exposes none of those tools or the command unless both
 `MAESTRI_WORKSPACE_ID` and `MAESTRI_SOCKET` are present.
 
 Maestri owns the canvas, connections, permissions and terminal lifecycle.
@@ -33,11 +33,13 @@ pi install npm:maestri-pi-operator@0.3.3
 ```
 
 The package may stay installed globally. Outside a Maestri terminal it registers
-no tools, hooks or skills, so it adds nothing to the agent prompt.
+no tools, hooks or command, so it adds nothing to the agent prompt.
 
-Pi cannot conditionally hide Maestri skills that another installer copied into
-its global skill directories. Maestri builds using that legacy installation
-must stop writing those copies when adopting the package-managed skills.
+`/maestri-operator` requires Maestri context. It injects concise operating
+guidance for an optional task; it does not replace the 14 native transport tools.
+Legacy global copies of the six skills belong to their installer and remain
+outside this package's control. Migrating or deleting those copies is an
+app/installer change, not an install or removal performed by this package.
 
 Android control additionally requires an Android SDK and an available emulator
 or a phone authorized for USB debugging. The extension does not install or
@@ -48,6 +50,16 @@ configure them.
 > fidelity and a real Android device journey remain unverified. See [known limits](#known-limits).
 
 ## Try it
+
+Use the command when you want Pi to take a Maestri task with the package's
+operating guidance:
+
+```text
+/maestri-operator Ask Reviewer to inspect the diff without interrupting work.
+```
+
+With no task, `/maestri-operator` queues guidance for the next user turn and
+does not start an operation.
 
 Start with discovery:
 
