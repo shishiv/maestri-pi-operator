@@ -27,7 +27,6 @@
     "bin",
     "docs",
     "firstmate-extension.json",
-    "resources",
     "dist"
   ],
   "scripts": {
