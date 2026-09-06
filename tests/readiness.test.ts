@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { classifyPiReadiness, type ReadinessSnapshot } from "../src/readiness.ts";
 import { replyEnvelope } from "../src/reply-envelope.ts";
@@ -71,6 +73,39 @@ const evalBorder = "─".repeat(86);
 function evalScreen(status: string, draft = "", cwd = "~/maestri-pi-operator (feat/ask-async)", footer = evalFooter): string {
 	return `${evalBorder}\n${draft}\n${evalBorder}\n${cwd}\n${footer}\n${status}`;
 }
+
+test("accepts the anchored Nexo idle capture with shell-like tool output in its transcript", () => {
+	const capture = readFileSync(new URL("./fixtures/readiness/nexo-idle.txt", import.meta.url));
+	assert.equal(createHash("sha256").update(capture).digest("hex"),
+		"9a1d9d0afc06ab9b3121a83da8c9a826812845acccefa89af217c2eaa2102870");
+	const result = classifyPiReadiness(snapshot({ screen: capture.toString("utf8") }));
+	assert.equal(result.verdict, "ready");
+	if (result.verdict === "ready") assert.deepEqual([result.model, result.thinking], ["Luna", "low"]);
+});
+
+test("never authenticates a real shell using a historical Pi footer or composer", () => {
+	for (const prompt of ["user@host:~/repo $", "PS C:\\repo>", "❯", "➜", "user@host %"]) {
+		for (const history of [evalFooter, evalScreen(""), evalScreen("Workspace indexed")]) {
+			const screen = `${history}\n${prompt}`;
+			assert.notEqual(classifyPiReadiness(snapshot({ screen })).verdict, "ready", screen);
+			assert.notEqual(classifyPiReadiness(snapshot({ screen, terminal_type: "shell" })).verdict, "ready", screen);
+		}
+	}
+});
+
+test("separates transcript prompts only after validating the complete empty composer", () => {
+	for (const transcript of ["└ cat >", "price $", "progress 100%", "<html>", "❯", "➜"]) {
+		assert.equal(classifyPiReadiness(snapshot({ screen: `${transcript}\n${evalScreen("Workspace indexed")}` })).verdict, "ready");
+		for (const surface of [
+			evalScreen("Workspace indexed", "unsent task"),
+			evalScreen("", `unsent task\n ${evalBorder}\n `),
+			evalScreen("Workspace indexed", "", "not a directory"),
+			evalScreen("Workspace indexed").replaceAll(evalBorder, ` ${evalBorder}`),
+			`${evalFooter}\nWorkspace indexed`,
+		]) assert.notEqual(classifyPiReadiness(snapshot({ screen: `${transcript}\n${surface}` })).verdict, "ready");
+	}
+	assert.equal(classifyPiReadiness(snapshot({ screen: `${evalFooter}\n${evalScreen("")}` })).verdict, "ambiguous");
+});
 
 test("accepts one status line based on the empty composer layout, not its text", () => {
 	for (const status of ["", "Workspace indexed", "Review mode · enabled", "arbitrary text", "native · native", "cli-a · skill-cli", "cli-b · skill-cli"]) {

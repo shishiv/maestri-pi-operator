@@ -68,6 +68,19 @@ function staleAge(snapshot: ReadinessSnapshot): number | null {
 	return age < 0 || age > snapshot.max_age_ms ? age : null;
 }
 
+function emptyComposerStart(rawLines: string[], footerIndex: number): number | undefined {
+	const beforeFooter = rawLines.slice(0, footerIndex);
+	const borders = beforeFooter.flatMap((line, index) => COMPOSER_BORDER.test(line) ? [index] : []);
+	const bottom = borders.at(-1);
+	const top = borders.at(-2);
+	if (top === undefined || bottom === undefined || bottom <= top + 1) return undefined;
+	const belowComposer = beforeFooter.slice(bottom + 1).map((line) => line.trim()).filter(Boolean);
+	if (rawLines[top].trimEnd() !== rawLines[bottom].trimEnd()
+		|| beforeFooter.slice(top + 1, bottom).some((line) => line.trim())
+		|| belowComposer.length !== 1 || !/^(?:~(?:$|\/|\s+(?:\(|•))|\/)/.test(belowComposer[0])) return undefined;
+	return top;
+}
+
 export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 	if (snapshot.screen === null) return { verdict: "unsupported", reason: "no-capture" };
 	if (snapshot.truncated) return { verdict: "unsupported", reason: "truncated" };
@@ -80,14 +93,24 @@ export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 	const rawLines = normalizeScreen(snapshot.screen).split("\n");
 	const screenLines = rawLines.map((line) => line.trim());
 	const lines = screenLines.filter(Boolean);
-	if (lines.length === 0) return { verdict: "blank" };
+	const last = lines.at(-1);
+	if (last === undefined) return { verdict: "blank" };
 
 	const footers = lines.flatMap((line) => {
 		const match = line.match(PI_FOOTER);
 		return match ? [{ line, match }] : [];
 	});
+	const footer = footers[0];
+	const footerIndex = footer ? screenLines.indexOf(footer.line) : -1;
+	const trailing = screenLines.slice(footerIndex + 1).filter(Boolean);
+	// One shared tail rule gates both transcript exclusion and final acceptance.
+	const supportedTail = trailing.length <= 1;
+	const composerStart = footer && supportedTail ? emptyComposerStart(rawLines, footerIndex) : undefined;
+	// Only a complete empty composer can separate transcript from the active surface.
+	// Keep the footer/status tail in scope: a shell after a historical Pi must fail closed.
+	const surfaceLines = composerStart === undefined ? lines : screenLines.slice(composerStart).filter(Boolean);
 	// Our reply delimiters end in '>' but are transcript content, not shell prompts.
-	const shellLines = lines.filter((line) => !isReplyEnvelopeMarker(line) && SHELL_PROMPT.test(line));
+	const shellLines = surfaceLines.filter((line) => !isReplyEnvelopeMarker(line) && SHELL_PROMPT.test(line));
 	if (footers.length > 1 || (footers.length > 0 && shellLines.length > 0)) {
 		return { verdict: "ambiguous", evidence: [...footers.map(({ line }) => line), ...shellLines].join("\n") };
 	}
@@ -95,36 +118,23 @@ export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 	const busy = lines.slice(-12).find((line) => BUSY.some((pattern) => pattern.test(line)));
 	if (busy) return { verdict: "busy", evidence: busy };
 
-	const last = lines.at(-1) as string;
 	if (SHELL_PROMPT.test(last)) return { verdict: "shell", evidence: last };
-	const footer = footers[0];
 	if (!footer) return { verdict: "unsupported", reason: "unknown-surface" };
-	const footerIndex = screenLines.indexOf(footer.line);
-	const trailing = screenLines.slice(footerIndex + 1).filter(Boolean);
 	// The TUI reserves one line below the footer for status. Its text cannot
 	// authenticate readiness; accepting it requires the empty composer layout below.
-	if (trailing.length > 1) {
+	if (!supportedTail) {
 		return { verdict: "unsupported", reason: "unknown-surface" };
 	}
 
-	// Keep blank rows until checking the composer: filtering them first hides drafts.
 	const beforeFooter = screenLines.slice(0, footerIndex);
-	const borders = rawLines.slice(0, footerIndex).flatMap((line, index) => COMPOSER_BORDER.test(line) ? [index] : []);
-	const bottom = borders.at(-1);
-	const top = borders.at(-2);
-	if (beforeFooter.some((line) => COMPOSER_BORDER.test(line)) || trailing.length > 0) {
-		const belowComposer = bottom === undefined ? [] : beforeFooter.slice(bottom + 1).filter(Boolean);
-		if (top === undefined || bottom === undefined || bottom <= top + 1
-			|| rawLines[top].trimEnd() !== rawLines[bottom].trimEnd()
-			|| beforeFooter.slice(top + 1, bottom).some(Boolean)
-			|| belowComposer.length !== 1 || !/^(?:~(?:$|\/|\s+(?:\(|•))|\/)/.test(belowComposer[0])) {
-			return { verdict: "unsupported", reason: "unknown-surface" };
-		}
+	if ((beforeFooter.some((line) => COMPOSER_BORDER.test(line)) || trailing.length > 0) && composerStart === undefined) {
+		return { verdict: "unsupported", reason: "unknown-surface" };
 	}
 
 	const modelId = footer.match[1].toLowerCase();
 	const model: Extract<Readiness, { verdict: "ready" }>["model"] = modelId.endsWith("luna")
 		? "Luna" : modelId.endsWith("terra") ? "Terra" : modelId.endsWith("sol") ? "Sol" : "Astra";
+	// SAFETY: PI_FOOTER restricts both capture groups to the PiThinkingLevel literals.
 	const thinking = (footer.match[3] ?? footer.match[4]) as PiThinkingLevel;
 	const format: ReadyFooter = footer.match[2] ? "thinking-off" : footer.match.index === 0 ? "minimal" : "full";
 	return { verdict: "ready", footer: format, model, thinking, evidence: footer.line };
