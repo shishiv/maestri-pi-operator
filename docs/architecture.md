@@ -7,9 +7,17 @@ e montagem automática do canvas ficam fora deste pacote.
 
 ## Entrada e execução
 
-`src/index.ts` registra catorze tools de comunicação, roles, notas e portais, além
-do notificador de respostas async. Não registra comandos de operação nem
-injeta instruções de planejamento no startup.
+`src/index.ts` exige `MAESTRI_WORKSPACE_ID` e `MAESTRI_SOCKET` antes de registrar
+qualquer superfície. Sem ambas, não registra tools, hooks ou skills. Dentro do
+Maestri, registra catorze tools de comunicação, roles, notas e portais, além do
+notificador de respostas async. Também fornece seis skills operacionais por
+`resources_discover`; elas ficam em `resources/skills`, fora da descoberta
+estática do pacote. Não injeta instruções de planejamento no startup.
+
+O gate controla somente recursos deste pacote. Cópias das mesmas skills gravadas
+por versões anteriores do aplicativo nos diretórios globais do agente precisam
+ser retiradas pelo instalador que as criou; a API de extensão do Pi não remove
+skills descobertas de outras origens.
 
 A fonte permanece em TypeScript e MJS. `scripts/build.mjs` gera `dist/` limpo
 com o compilador local, reescrevendo imports relativos para JavaScript. O pacote

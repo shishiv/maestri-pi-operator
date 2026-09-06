@@ -39,6 +39,9 @@ test("installed tarball runs its external CLI and durable runner without a TypeS
 	for (const required of [
 		"package.json", "README.md", "bin/mpo-extension", "dist/index.js", "dist/index.d.ts",
 		"dist/ask-runner.mjs", "dist/extension-cli.mjs", "docs/architecture.md", "firstmate-extension.json",
+		"resources/skills/maestri/SKILL.md", "resources/skills/maestri-manager/SKILL.md",
+		"resources/skills/maestri-portal/SKILL.md", "resources/skills/maestri-portal-devices/SKILL.md",
+		"resources/skills/maestri-routines/SKILL.md", "resources/skills/maestri-workspace/SKILL.md",
 	]) assert.ok(packed.includes(required), `missing packed file: ${required}`);
 	assert.ok(packed.every((entry) => !/^(?:src|skills|maestri\/roles|\.artifacts)\//.test(entry)), "retired or local sources leaked into the tarball");
 	await exec("npm", ["install", "--offline", "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund", archive], {
@@ -70,6 +73,44 @@ test("installed tarball runs its external CLI and durable runner without a TypeS
 		package_digest: `sha256:${"2".repeat(64)}`,
 		capability: { name: "process-event-adapter", versions: [1], adapter_names: ["maestri-ask"] },
 	};
+
+	await t.test("the installed package hides its tools and bundled skills outside Maestri", async () => {
+		const script = path.join(consumer, "surface-probe.mjs");
+		await writeFile(script, `
+import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+const loader = new DefaultResourceLoader({
+  cwd: process.cwd(),
+  agentDir: process.env.HOME + "/.pi/agent",
+  settingsManager: SettingsManager.inMemory({ packages: [process.env.MPO_INSTALLED_PACKAGE] }),
+  noPromptTemplates: true,
+  noThemes: true,
+  noContextFiles: true,
+});
+await loader.reload();
+const { session } = await createAgentSession({ resourceLoader: loader, sessionManager: SessionManager.inMemory() });
+await session.bindExtensions({});
+const result = {
+  tools: session.getAllTools().map((tool) => tool.name).filter((name) => name.startsWith("maestri")).sort(),
+  skills: session.resourceLoader.getSkills().skills.map((skill) => skill.name).filter((name) => name.startsWith("maestri")).sort(),
+};
+await new Promise((resolve) => process.stdout.write(JSON.stringify(result), resolve));
+process.exit(0);
+`);
+		const probeEnv = { ...env, MPO_INSTALLED_PACKAGE: installed };
+		const outside = JSON.parse((await exec(process.execPath, [script], { cwd: consumer, env: probeEnv, timeout: 5_000 })).stdout);
+		assert.deepEqual(outside, { tools: [], skills: [] });
+		const insideEnv = {
+			...probeEnv,
+			MAESTRI_WORKSPACE_ID: "fixture-workspace",
+			MAESTRI_TERMINAL_ID: "fixture-terminal",
+			MAESTRI_SOCKET: "/tmp/fixture.sock",
+		};
+		const inside = JSON.parse((await exec(process.execPath, [script], { cwd: consumer, env: insideEnv, timeout: 5_000 })).stdout);
+		assert.equal(inside.tools.length, 14);
+		assert.deepEqual(inside.skills.sort(), [
+			"maestri", "maestri-manager", "maestri-portal", "maestri-portal-devices", "maestri-routines", "maestri-workspace",
+		].sort());
+	});
 
 	await t.test("the installed executable handles a protocol handshake", async () => {
 		const child = spawn(bin, ["handshake"], { cwd: consumer, env, timeout: 5_000, killSignal: "SIGKILL", stdio: ["pipe", "pipe", "pipe"] });

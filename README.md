@@ -8,7 +8,9 @@
 
 Talk to connected agents, keep shared notes, inspect browser pages and control
 Android portals without leaving Pi. The package provides **14 typed tools**,
-durable async replies and screenshots returned as images.
+six Maestri usage skills, durable async replies and screenshots returned as
+images. The extension exposes none of those tools or skills unless both
+`MAESTRI_WORKSPACE_ID` and `MAESTRI_SOCKET` are present.
 
 Maestri owns the canvas, connections, permissions and terminal lifecycle.
 This extension supplies transport. It does not ship planning skills, playbooks,
@@ -29,6 +31,13 @@ Run `/reload` in an existing Pi session. To pin this release:
 ```sh
 pi install npm:maestri-pi-operator@0.3.2
 ```
+
+The package may stay installed globally. Outside a Maestri terminal it registers
+no tools, hooks or skills, so it adds nothing to the agent prompt.
+
+Pi cannot conditionally hide Maestri skills that another installer copied into
+its global skill directories. Maestri builds using that legacy installation
+must stop writing those copies when adopting the package-managed skills.
 
 Android control additionally requires an Android SDK and an available emulator
 or a phone authorized for USB debugging. The extension does not install or

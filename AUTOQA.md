@@ -81,6 +81,9 @@ transformar bloqueio em sucesso ou contar uma ação de portal como prova de tod
     separadores que parecem bordas, além de busy, shell e captura ambígua.
 18. Falha de leitura do journal em scan agendado: aviso sem dados sensíveis,
     nenhuma rejeição não tratada, nenhum ack falso e recuperação em evento posterior.
+19. Contexto ausente: sem `MAESTRI_WORKSPACE_ID` ou sem `MAESTRI_SOCKET`, o
+    pacote não registra tools, hooks nem skills. Com ambas, registra as catorze
+    tools e descobre exatamente as seis skills Maestri empacotadas.
 
 Leia o diff de cada rodada e acrescente os casos novos. Um teste unitário verde
 não substitui uma jornada de integração. Registre separadamente casos ao vivo,

@@ -304,9 +304,13 @@ export function assertConnected(env: Environment, platform: Platform): void {
 	if (platform !== "linux") {
 		throw new Error("The v0.1 Maestri tools currently support Linux only");
 	}
-	if (!env.MAESTRI_WORKSPACE_ID || !env.MAESTRI_SOCKET) {
+	if (!hasMaestriContext(env)) {
 		throw new Error("Maestri context is unavailable; MAESTRI_WORKSPACE_ID and MAESTRI_SOCKET must be present");
 	}
+}
+
+export function hasMaestriContext(env: Environment): boolean {
+	return Boolean(env.MAESTRI_WORKSPACE_ID && env.MAESTRI_SOCKET);
 }
 
 export function assertAgent(agent: string): void {
