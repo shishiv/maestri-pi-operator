@@ -101,11 +101,12 @@ class AskNotifier {
 						display: true,
 						details: { request_id: claimed.request_id, digest: envelope.digest },
 					}, { deliverAs: "followUp", triggerTurn: true });
-					await this.markSent(claimed.request_id, envelope.digest);
 				} catch {
 					this.failed.add(key);
 					await this.markFailed(claimed.request_id, envelope.digest);
+					continue;
 				}
+				await this.markSent(claimed.request_id, envelope.digest);
 			}
 			this.failureReported = false;
 		} catch {
