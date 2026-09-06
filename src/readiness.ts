@@ -36,7 +36,7 @@ export type Readiness =
 	| { verdict: "stale"; age_ms: number }
 	| { verdict: "unsupported"; reason: UnsupportedReason };
 
-const PI_FOOTER = /(?:^|\s)(GPT-5\.6\s+(?:Luna|Terra|Sol)|GPT-6\s+Astra|gpt-6-astra)\s+•\s+(?:(thinking)\s+(off)|(off|minimal|low|medium|high|xhigh|max))\s*$/;
+const PI_FOOTER = /(?:^|\s)(gpt-5\.6(?:\s+|-)(?:luna|terra|sol)|gpt-6(?:\s+|-)astra)\s+•\s+(?:(thinking)\s+(off)|(off|minimal|low|medium|high|xhigh|max))\s*$/i;
 const BUSY = [
 	/^\s*[\u2800-\u28ff]?\s*Working(?:\.\.\.)?(?:\s*\([^)]*\))?\s*$/i,
 	/\b(?:esc|escape|ctrl-c)\s+to\s+(?:interrupt|cancel)\b/i,
@@ -122,9 +122,9 @@ export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 		}
 	}
 
-	const model = (footer.match[1] === "gpt-6-astra"
-		? "Astra"
-		: footer.match[1].split(/\s+/).at(-1)) as Extract<Readiness, { verdict: "ready" }>["model"];
+	const modelId = footer.match[1].toLowerCase();
+	const model: Extract<Readiness, { verdict: "ready" }>["model"] = modelId.endsWith("luna")
+		? "Luna" : modelId.endsWith("terra") ? "Terra" : modelId.endsWith("sol") ? "Sol" : "Astra";
 	const thinking = (footer.match[3] ?? footer.match[4]) as PiThinkingLevel;
 	const format: ReadyFooter = footer.match[2] ? "thinking-off" : footer.match.index === 0 ? "minimal" : "full";
 	return { verdict: "ready", footer: format, model, thinking, evidence: footer.line };

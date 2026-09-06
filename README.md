@@ -27,7 +27,7 @@ pi install npm:maestri-pi-operator
 Run `/reload` in an existing Pi session. To pin this release:
 
 ```sh
-pi install npm:maestri-pi-operator@0.3.1
+pi install npm:maestri-pi-operator@0.3.2
 ```
 
 Android control additionally requires an Android SDK and an available emulator

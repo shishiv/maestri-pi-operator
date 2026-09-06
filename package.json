@@ -1,6 +1,6 @@
 {
   "name": "maestri-pi-operator",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Native Maestri transport tools for Pi.",
   "type": "module",
   "engines": {

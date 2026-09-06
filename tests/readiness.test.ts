@@ -56,11 +56,20 @@ test("accepts only current idle Pi footers including off and minimal thinking", 
 	});
 });
 
+test("accepts provider model IDs rendered by explicit Pi model arguments", () => {
+	for (const [id, model] of [["gpt-5.6-luna", "Luna"], ["gpt-5.6-terra", "Terra"], ["gpt-5.6-sol", "Sol"]] as const) {
+		const footer = `0.0%/1.1M (auto) ${id} • low`;
+		const result = classifyPiReadiness(snapshot({ screen: evalScreen("Codex adapter V: low", "", "~", footer) }));
+		assert.equal(result.verdict, "ready", id);
+		if (result.verdict === "ready") assert.deepEqual([result.model, result.thinking], [model, "low"]);
+	}
+});
+
 // Captured in the canvas eval before observer.ts's setStatus was removed.
 const evalFooter = "0.0%/1.1M (auto)                                                     gpt-6-astra • low";
 const evalBorder = "─".repeat(86);
-function evalScreen(status: string, draft = "", cwd = "~/maestri-pi-operator (feat/ask-async)"): string {
-	return `${evalBorder}\n${draft}\n${evalBorder}\n${cwd}\n${evalFooter}\n${status}`;
+function evalScreen(status: string, draft = "", cwd = "~/maestri-pi-operator (feat/ask-async)", footer = evalFooter): string {
+	return `${evalBorder}\n${draft}\n${evalBorder}\n${cwd}\n${footer}\n${status}`;
 }
 
 test("accepts one status line based on the empty composer layout, not its text", () => {
