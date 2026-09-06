@@ -29,7 +29,7 @@ pi install npm:maestri-pi-operator
 Run `/reload` in an existing Pi session. To pin this release:
 
 ```sh
-pi install npm:maestri-pi-operator@0.3.2
+pi install npm:maestri-pi-operator@0.3.3
 ```
 
 The package may stay installed globally. Outside a Maestri terminal it registers
