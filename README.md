@@ -253,3 +253,11 @@ Existing notes, roles and old apply records are left untouched. There is no
 automatic manifest migration, replay or deletion of canvas resources.
 
 </details>
+
+## Lint anti-slop e dívida conhecida
+
+`npm run lint` roda as regras anti-slop. Elas entraram em 0.3.3 sobre código que
+não foi escrito para elas: **109 achados pré-existentes** (src e tests). As regras
+ficam **ligadas como `warn`**, nunca desligadas, para o gate passar sem esconder
+nada. Baixe cada regra para `error` conforme a dívida daquela regra chegar a zero.
+Código novo não deve acrescentar achado.
