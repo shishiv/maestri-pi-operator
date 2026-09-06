@@ -9,6 +9,7 @@ export type UnsupportedReason =
 	| "truncated"
 	| "non-utf8"
 	| "unsupported-terminal-type"
+	| "unsupported-model"
 	| "unknown-surface";
 
 export interface ReadinessSnapshot {
@@ -25,7 +26,7 @@ export type Readiness =
 	| {
 		verdict: "ready";
 		footer: ReadyFooter;
-		model: "Luna" | "Terra" | "Sol" | "Astra";
+		model: "Luna" | "Terra" | "Sol" | "Astra" | "Opus";
 		thinking: PiThinkingLevel;
 		evidence: string;
 	}
@@ -36,7 +37,7 @@ export type Readiness =
 	| { verdict: "stale"; age_ms: number }
 	| { verdict: "unsupported"; reason: UnsupportedReason };
 
-const PI_FOOTER = /(?:^|\s)(gpt-5\.6(?:\s+|-)(?:luna|terra|sol)|gpt-6(?:\s+|-)astra)\s+•\s+(?:(thinking)\s+(off)|(off|minimal|low|medium|high|xhigh|max))\s*$/i;
+const PI_FOOTER = /(?:^|\s)(gpt-5\.6(?:\s+|-)(?:luna|terra|sol)|gpt-6(?:\s+|-)astra|claude-opus-5)\s+•\s+(?:(thinking)\s+(off)|(off|minimal|low|medium|high|xhigh|max))\s*$/i;
 const BUSY = [
 	/^\s*[\u2800-\u28ff]?\s*Working(?:\.\.\.)?(?:\s*\([^)]*\))?\s*$/i,
 	/\b(?:esc|escape|ctrl-c)\s+to\s+(?:interrupt|cancel)\b/i,
@@ -133,7 +134,7 @@ export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 
 	const modelId = footer.match[1].toLowerCase();
 	const model: Extract<Readiness, { verdict: "ready" }>["model"] = modelId.endsWith("luna")
-		? "Luna" : modelId.endsWith("terra") ? "Terra" : modelId.endsWith("sol") ? "Sol" : "Astra";
+		? "Luna" : modelId.endsWith("terra") ? "Terra" : modelId.endsWith("sol") ? "Sol" : modelId === "claude-opus-5" ? "Opus" : "Astra";
 	// SAFETY: PI_FOOTER restricts both capture groups to the PiThinkingLevel literals.
 	const thinking = (footer.match[3] ?? footer.match[4]) as PiThinkingLevel;
 	const format: ReadyFooter = footer.match[2] ? "thinking-off" : footer.match.index === 0 ? "minimal" : "full";

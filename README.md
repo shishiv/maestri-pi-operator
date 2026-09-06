@@ -112,7 +112,9 @@ unacknowledged result once.
 - Timeout, cancellation or unknown delivery **never authorizes an automatic resend**.
 
 Readiness detection currently recognizes GPT-5.6 Luna, Terra and Sol footers,
-plus GPT-6 Astra and `gpt-6-astra`. One trailing status line is supported only
+plus GPT-6 Astra, `gpt-6-astra`, and the specifically captured `claude-opus-5`
+footer layout. This is a fixed allowlist: adding another model requires a
+captured footer and an explicit code/test update. One trailing status line is supported only
 with a recognized, empty composer and directory/footer layout. Drafts and
 ambiguous layouts are refused; terminal text is not an authenticated readiness API.
 See the

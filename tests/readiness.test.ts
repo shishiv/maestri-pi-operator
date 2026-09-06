@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { classifyPiReadiness, type ReadinessSnapshot } from "../src/readiness.ts";
 import { replyEnvelope } from "../src/reply-envelope.ts";
+import { assertReadyPiScreen, PreflightError } from "../src/ask-async.ts";
 
 function snapshot(overrides: Partial<ReadinessSnapshot> = {}): ReadinessSnapshot {
 	return {
@@ -55,6 +56,30 @@ test("accepts only current idle Pi footers including off and minimal thinking", 
 		model: "Astra",
 		thinking: "high",
 		evidence: "GPT-6 Astra • high",
+	});
+	assert.deepEqual(classifyPiReadiness(snapshot({ screen: "0.0%/1.1M (auto) claude-opus-5 • high" })), {
+		verdict: "ready", footer: "full", model: "Opus", thinking: "high", evidence: "0.0%/1.1M (auto) claude-opus-5 • high",
+	});
+});
+
+test("does not broaden the model allowlist beyond the captured Opus identity", () => {
+	for (const model of ["claude-opus-5.1", "claude-sonnet-4", "gpt-7-astra"]) {
+		assert.deepEqual(classifyPiReadiness(snapshot({ screen: `${model} • high` })), { verdict: "unsupported", reason: "unknown-surface" });
+	}
+});
+
+test("preflight keeps the legacy refusal text and exposes sanitized structured diagnostics", () => {
+	assert.throws(() => assertReadyPiScreen("⠴ Working\nclaude-opus-5 • high"), (error: unknown) => {
+		assert.ok(error instanceof PreflightError);
+		assert.equal(error.message, "The target Pi is busy; no async request was launched");
+		assert.deepEqual(error.preflight, { stage: "readiness", reason: "busy", request_created: false });
+		return true;
+	});
+	assert.throws(() => assertReadyPiScreen("claude-opus-5.1 • high"), (error: unknown) => {
+		assert.ok(error instanceof PreflightError);
+		assert.equal(error.message, "The target is missing, ambiguous, or not a ready Pi; no async request was launched");
+		assert.deepEqual(error.preflight, { stage: "readiness", reason: "unknown-surface", request_created: false });
+		return true;
 	});
 });
 
