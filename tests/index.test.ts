@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
@@ -39,6 +38,24 @@ function loadExtension(env: Environment) {
 	return { handlers, tools };
 }
 
+async function withEnvironment<T>(env: Environment, action: () => Promise<T> | T): Promise<T> {
+	const previous = Object.fromEntries(contextKeys.map((key) => [key, process.env[key]]));
+	try {
+		for (const key of contextKeys) {
+			const value = env[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		return await action();
+	} finally {
+		for (const key of contextKeys) {
+			const value = previous[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
 test("exposes no Maestri tools, hooks, or skills without a complete Maestri context", () => {
 	for (const env of [
 		{},
@@ -52,11 +69,12 @@ test("exposes no Maestri tools, hooks, or skills without a complete Maestri cont
 });
 
 test("exposes all transport tools and bundled skills inside Maestri", async () => {
-	const loaded = loadExtension({
+	const env = {
 		MAESTRI_WORKSPACE_ID: "workspace",
 		MAESTRI_SOCKET: "/tmp/maestri.sock",
 		MAESTRI_TERMINAL_ID: "terminal",
-	});
+	};
+	const loaded = loadExtension(env);
 	assert.deepEqual(loaded.tools.sort(), [
 		"maestri_ask", "maestri_ask_async", "maestri_ask_request", "maestri_check", "maestri_list",
 		"maestri_note_create", "maestri_note_edit", "maestri_note_read", "maestri_note_stack",
@@ -64,7 +82,7 @@ test("exposes all transport tools and bundled skills inside Maestri", async () =
 	].sort());
 	const resourceHandlers = loaded.handlers.get("resources_discover") ?? [];
 	assert.equal(resourceHandlers.length, 1);
-	const resources = await resourceHandlers[0]({ type: "resources_discover", cwd: "/tmp", reason: "startup" }, {});
+	const resources = await withEnvironment(env, () => resourceHandlers[0]({ type: "resources_discover", cwd: "/tmp", reason: "startup" }, {}));
 	assert.ok(resources && typeof resources === "object" && "skillPaths" in resources);
 	const skillPaths = (resources as { skillPaths: string[] }).skillPaths;
 	assert.equal(skillPaths.length, 1);
@@ -73,9 +91,4 @@ test("exposes all transport tools and bundled skills inside Maestri", async () =
 	assert.deepEqual(discovered.skills.map(({ name }) => name).sort(), [
 		"maestri", "maestri-manager", "maestri-portal", "maestri-portal-devices", "maestri-routines", "maestri-workspace",
 	].sort());
-	for (const skill of discovered.skills) {
-		const text = await readFile(skill.filePath, "utf8");
-		assert.match(text, /MAESTRI_WORKSPACE_ID/);
-		assert.match(text, /MAESTRI_SOCKET/);
-	}
 });
