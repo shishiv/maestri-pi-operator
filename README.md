@@ -24,10 +24,10 @@ Requires **Linux**, **Node.js 24+**, and **Pi running in a Maestri terminal**.
 pi install npm:maestri-pi-operator
 ```
 
-Run `/reload` in an existing Pi session. To pin the published release:
+Run `/reload` in an existing Pi session. To pin this release:
 
 ```sh
-pi install npm:maestri-pi-operator@0.3.0
+pi install npm:maestri-pi-operator@0.3.1
 ```
 
 Android control additionally requires an Android SDK and an available emulator
@@ -35,8 +35,8 @@ or a phone authorized for USB debugging. The extension does not install or
 configure them.
 
 > **Validation status:** transport tests and model-backed smoke tests pass.
-> Real web DOM, forms and navigation were verified. The full visual journey
-> and a real Android device journey remain unverified. See [known limits](#known-limits).
+> Real web DOM, forms, click, PNG capture and navigation were verified. Screenshot
+> fidelity and a real Android device journey remain unverified. See [known limits](#known-limits).
 
 ## Try it
 
@@ -94,11 +94,19 @@ unacknowledged result once.
 - Requests are private to the Maestri workspace and calling terminal.
 - Idempotency lasts while the receipt is retained: up to seven days and the
   newest 200 terminal requests, whichever keeps fewer records.
-- Prompt bodies and credentials are not journaled.
+- Structured receipts store only the prompt digest and byte count. The private
+  terminal capture can contain rendered prompt and reply text until retention
+  removes it; do not use async asks for secrets.
+- New prompts are limited to 65,536 UTF-8 bytes after CLI encoding; async prompts
+  also include the reply envelope. Existing receipts remain recoverable by their
+  original key even if the new wire limit would reject a new send.
 - Timeout, cancellation or unknown delivery **never authorizes an automatic resend**.
 
 Readiness detection currently recognizes GPT-5.6 Luna, Terra and Sol footers,
-plus GPT-6 Astra and `gpt-6-astra`. See the
+plus GPT-6 Astra and `gpt-6-astra`. One trailing status line is supported only
+with a recognized, empty composer and directory/footer layout. Drafts and
+ambiguous layouts are refused; terminal text is not an authenticated readiness API.
+See the
 [architecture](docs/architecture.md) for process custody and restart behavior.
 
 ### Browser and Android portals
@@ -136,6 +144,10 @@ Cancellation terminates the local Linux process group and discards partial
 output. It does **not** prove that an action already delivered to Maestri was
 cancelled. Inspect the current resource before deciding on another interaction.
 
+Terminal async results include `reason`, `termination` and `exit_code`.
+Recognized runner startup errors are reported as bounded codes, not raw stderr.
+These diagnostics do not turn unknown delivery into permission to resend.
+
 The extension uses an executable `MAESTRI_CLI`, falling back to `maestri` on
 `PATH`. Maestri context requires `MAESTRI_WORKSPACE_ID` and `MAESTRI_SOCKET`;
 async asks also need `MAESTRI_TERMINAL_ID`. Credential values are never needed
@@ -147,7 +159,7 @@ The following behavior was observed with **Maestri 0.16.0**:
 
 | Limit | What it means |
 | --- | --- |
-| A loaded DOM is not a rendered frame | Native click and capture failed in live validation. Hover and drag also depend on the renderer. Their full live journey is not certified. |
+| Successful capture is not visual approval | Live runs have both returned PNGs and timed out in the renderer; one returned capture was reported black. Click state changed successfully, but hover, drag and pixel fidelity remain uncertified. |
 | Android needs a working SDK and device | The missing-SDK error was verified, not a real device journey. |
 | Creation finishes before readiness | A created portal may still be loading or booting. Inspect it before interacting. |
 | `check` is ambiguous in the CLI | `portal check NAME SELECTOR` captures instead of checking a checkbox. The tool omits it. `uncheck` works; inspect checkbox state before using `click`. |
@@ -166,11 +178,13 @@ npm run check
 npm run smoke
 ```
 
-`check` runs type checking and behavioral tests. `smoke` uses **GPT-6 Astra**
+`check` runs type checking, a clean JavaScript build and behavioral tests,
+including a tarball installed into isolated `node_modules`. `npm pack` builds
+the distributable automatically. `smoke` uses **GPT-6 Astra**
 against a controlled CLI and requires model access. It is not a live Maestri
 journey.
 
-Try the checkout without changing Pi settings:
+Try the checkout after `npm run build`, without changing Pi settings:
 
 ```sh
 pi -e /absolute/path/to/maestri-pi-operator

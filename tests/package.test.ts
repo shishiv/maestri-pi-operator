@@ -4,10 +4,11 @@ import { test } from "node:test";
 
 test("ships the Firstmate process-event adapter manifest", async () => {
 	const manifest = JSON.parse(await readFile(new URL("../firstmate-extension.json", import.meta.url), "utf8"));
+	const packageManifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 	assert.deepEqual(manifest, {
 		schema: "firstmate.extension-manifest.v1",
 		id: "org.maestri.pi-operator",
-		version: "0.3.0",
+		version: packageManifest.version,
 		host_protocols: [1],
 		entrypoint: "bin/mpo-extension",
 		capabilities: [{ name: "process-event-adapter", versions: [1], adapter_names: ["maestri-ask"] }],

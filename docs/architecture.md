@@ -11,6 +11,13 @@ e montagem automática do canvas ficam fora deste pacote.
 do notificador de respostas async. Não registra comandos de operação nem
 injeta instruções de planejamento no startup.
 
+A fonte permanece em TypeScript e MJS. `scripts/build.mjs` gera `dist/` limpo
+com o compilador local, reescrevendo imports relativos para JavaScript. O pacote
+distribui essa saída, incluindo declarações de tipos, e o Pi carrega `dist/index.js`.
+O runner e o executável externo não dependem do loader TypeScript do Pi.
+`bin/mpo-extension` conserva o caminho público e carrega `dist/extension-cli.mjs`,
+gerado de `src/extension-cli.mjs`. Não há transpiler adicional em runtime.
+
 `src/canvas-tools.ts` traduz parâmetros TypeBox em comandos fixos do CLI.
 Não interpreta listagens para planejar efeitos. Não gera páginas nem mantém
 manifests, bindings, versões ou um journal de mutações. Cada chamada executa
@@ -22,6 +29,12 @@ Notas usam leitura numerada, criação com nome estável, edição de trecho e
 organização em fichário. O Maestri recusa alterações em notas bloqueadas.
 A extensão escapa barras invertidas nos textos de notas e nos prompts de roles
 porque o CLI decodifica sequências de escape nesses argumentos.
+
+`src/cli-text.ts` possui o contrato dos prompts de ask. Sync e runner async
+codificam barras uma vez, na saída para o CLI. O digest continua sendo do texto
+lógico original. Pedidos novos validam os 65.536 bytes após encoding e envelope
+antes do preflight; recuperação de recibo existente precede essa validação de
+wire format. Essa regra não é aplicada indiscriminadamente a outros comandos.
 
 `src/maestri.ts` possui resolução do executável, ambiente mínimo, execução
 sem shell, cancelamento e formatação de saída. O processo recebe um grupo
@@ -65,11 +78,18 @@ pedido, exige uma captura atual de um Pi suportado e ocioso e recusa outro
 pedido ativo para o mesmo agente. `src/readiness.ts` classifica somente essa
 captura, sem afirmar liveness ou identidade do terminal.
 
+No layout completo, as bordas do composer devem ter a mesma largura e não
+podem ser linhas indentadas do rascunho. Uma linha de status após o footer é
+permitida somente com composer vazio e diretório reconhecido. O texto do status
+não comprova prontidão. Layouts desconhecidos continuam recusados.
+
 `src/ask-store.ts` persiste o recibo antes do spawn. O escopo é derivado de
 workspace e terminal sob
 `${XDG_STATE_HOME:-~/.local/state}/maestri-pi-operator/ask/scopes`.
-Diretórios usam modo `0700` e arquivos `0600`. Prompt e environment não são
-persistidos. Registros estrangeiros ou legados sem escopo são recusados.
+Diretórios usam modo `0700` e arquivos `0600`. O recibo guarda somente digest e
+tamanho do prompt, não seu corpo nem o environment. A captura sanitizada do
+terminal é outro arquivo privado e pode repetir o prompt renderizado e a resposta
+até a retenção removê-los. Registros estrangeiros ou legados sem escopo são recusados.
 
 Replay da mesma chave, agente e digest de prompt retorna o mesmo request ID.
 Payload diferente conflita antes do envio. A garantia termina com a retenção
@@ -80,6 +100,11 @@ conjunto menor.
 pode avançar o pedido de accepted para running. Restart reconcilia PID, PGID,
 o instante de criação em `/proc` e o cmdline completo antes de confiar ou
 sinalizar o grupo. Identidade ambígua nunca autoriza um sinal ou reenvio.
+
+O prazo de handshake também limita backpressure ao escrever o payload do runner.
+Falhas de startup retêm apenas códigos de erro reconhecidos, sem tratar stderr
+como resposta do peer. Status e result projetam reason, termination e exit_code
+sanitizados; não alteram retrospectivamente a certeza de entrega do recibo.
 
 Delivery e reply são estados separados. O runner sanitiza a captura antes de
 persisti-la. `src/reply-envelope.ts` isola uma resposta pelos marcadores do
@@ -97,9 +122,19 @@ para permitir a retomada mesmo em uma sessão sem briefing anterior.
 Um claim estrangeiro vivo impede outro envio. Restart pode repetir uma
 notificação não reconhecida uma vez por sessão. Ler result faz o ack.
 
+O notifier reavalia também em `agent_settled`, porque `agent_end` pode ainda
+ocorrer durante busy. Reconfere idle após IO, coalesce eventos sobrepostos e
+aguarda gravações em andamento no shutdown. Não há polling contínuo do modelo.
+
+Falhas de leitura ou gravação durante o scan em segundo plano são contidas e
+geram um aviso genérico na UI ou stderr, sem conteúdo do journal. O aviso não se
+repete até um scan bem-sucedido. Nenhum recibo é apagado para esconder a falha;
+um evento posterior permite nova verificação, sem reenviar prompts.
+
 `src/ask-terminal.ts` define o envelope canônico `mpo.ask-terminal.v1`,
 limitado a 4 KiB e sem texto de prompt ou resposta. `src/ask-waiter.ts` e
-`bin/mpo-extension` oferecem espera finita e somente leitura, além do adapter
+`src/extension-cli.mjs`, exposto por `bin/mpo-extension`, oferecem espera finita
+e somente leitura, além do adapter
 Firstmate `maestri-ask`. Eles não fazem claim, ack, cancelamento ou reenvio.
 Captura, publicação, acknowledgement e re-arm externos pertencem ao Firstmate.
 
@@ -109,6 +144,13 @@ Captura, publicação, acknowledgement e re-arm externos pertencem ao Firstmate.
 ao efeito, limites de saída, cancelamento e os contratos de persistência async.
 `npm run smoke` verifica o carregamento e chamadas nativas no Pi com CLI
 controlado. O smoke ao vivo é separado e exige um terminal descartável.
+
+`tests/installed-package.test.ts` instala o tarball, sem link ao checkout, e
+exercita o executável externo, o runner, o waiter e a entrada pública. O cache npm
+é vazio; somente os peers declarados são fornecidos por links explícitos para a
+instalação de desenvolvimento versionada. O pacote testado não é um link para o
+checkout. A criação do recibo e o CLI são controlados; isso não substitui uma jornada Pi/Maestri real usando
+o mesmo pacote instalado. Os testes determinísticos não exigem modelo pago.
 
 O pacote não possui autoridade sobre backlog, branches, worktrees ou entrega.
 O conteúdo dos papéis é fornecido pelo chamador, não por este pacote.

@@ -17,6 +17,7 @@ import {
 } from "./ask-store.ts";
 import { redactSensitiveText } from "./output.ts";
 import { extractReplyEnvelope } from "./reply-envelope.ts";
+import { encodeAskPrompt } from "./cli-text.ts";
 
 const [root, requestId, token] = process.argv.slice(2);
 
@@ -25,7 +26,8 @@ async function readPayload() {
 	let bytes = 0;
 	for await (const chunk of createReadStream(null, { fd: 3, autoClose: true })) {
 		bytes += chunk.length;
-		if (bytes > 70_000) throw new Error("Runner payload exceeds its limit");
+		// JSON may expand accepted control characters to six bytes each.
+		if (bytes > 512 * 1024) throw new Error("Runner payload exceeds its limit");
 		chunks.push(chunk);
 	}
 	const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -166,6 +168,7 @@ async function preserveOrphan(reason, cleanupDeadlineMs) {
 async function run() {
 	if (!root || !requestId || !token) throw new Error("Missing runner identity");
 	const payload = await readPayload();
+	const cliPrompt = encodeAskPrompt(payload.prompt);
 	if (!(await handshake())) return;
 	const stdout = [];
 	const stderr = [];
@@ -176,7 +179,7 @@ async function run() {
 	let timeout;
 	let settled = false;
 	let spawned = false;
-	const child = spawn(payload.command, ["ask", payload.agent, payload.prompt], {
+	const child = spawn(payload.command, ["ask", payload.agent, cliPrompt], {
 		cwd: payload.cwd,
 		detached: false,
 		env: { ...process.env },

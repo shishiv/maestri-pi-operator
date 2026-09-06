@@ -148,6 +148,34 @@ test("uses fixed argv, cwd, timeout, and the caller AbortSignal", async (t) => {
 	}
 });
 
+test("prompt fidelity after controlled CLI escape decoding", async (t) => {
+	const { cli } = await fixture(t);
+	const { calls, tools } = makeHarness(cli);
+	const prompt = String.raw`C:\tmp\notes literal \n \t \\ \\\\ "quotes" 'single' ` + "`$HOME é 😀\nreal\ttab";
+	await invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt });
+	// Controlled decoder: n, t and doubled backslash verified against installed CLI /ask HTTP body.
+	const received = calls[0].args[2].replace(/\\([\\nt])/g, (_, escape: string) =>
+		escape === "n" ? "\n" : escape === "t" ? "\t" : "\\");
+	assert.equal(received, prompt);
+});
+
+test("prompt fidelity enforces encoded UTF-8 byte boundary before execution", async (t) => {
+	const { cli } = await fixture(t);
+	const { calls, tools } = makeHarness(cli);
+	const ask = tools.get("maestri_ask")!;
+	await assert.rejects(invoke(ask, { agent: "Peer", prompt: "\\".repeat(32_769) }), /UTF-8 bytes/);
+	assert.equal(calls.length, 0);
+	await invoke(ask, { agent: "Peer", prompt: "\\".repeat(32_768) });
+	assert.equal(Buffer.byteLength(calls[0].args[2]), 65_536);
+});
+
+test("passes an option-looking prompt in the CLI's post-agent prompt position", async (t) => {
+	const { cli } = await fixture(t);
+	const { calls, tools } = makeHarness(cli);
+	await invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "--raw" });
+	assert.deepEqual(calls[0].args, ["ask", "Peer", "--raw"]);
+});
+
 test("passes only the minimal environment needed by the native CLI", () => {
 	assert.deepEqual(
 		maestriCliEnvironment({
@@ -216,10 +244,6 @@ test("rejects option-like names, NUL, and oversized UTF-8 prompts before exec", 
 	const { calls, tools } = makeHarness(cli);
 	await assert.rejects(invoke(tools.get("maestri_check")!, { agent: "--help" }), /must not start/);
 	await assert.rejects(invoke(tools.get("maestri_check")!, { agent: "bad\0name" }), /no NUL/);
-	await assert.rejects(
-		invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "--raw" }),
-		/prompt must not start/,
-	);
 	await assert.rejects(
 		invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "é".repeat(32_769) }),
 		/UTF-8 bytes/,

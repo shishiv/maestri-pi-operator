@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
@@ -24,6 +24,7 @@ import {
 	ensureAskStateRoot,
 	outputPath,
 	promptDigest,
+	transitionTerminal,
 	type AskRequestRecord,
 } from "../src/ask-store.ts";
 
@@ -68,7 +69,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const events = path.join(path.dirname(process.argv[1]), "events");
-const [action, agent, prompt] = process.argv.slice(2);
+const [action, agent, wirePrompt] = process.argv.slice(2);
+// Controlled escape decoder, verified against the installed CLI's /ask HTTP body.
+const prompt = wirePrompt?.replace(/\\\\([\\\\nt])/g, (_, escape) => escape === "n" ? "\\n" : escape === "t" ? "\\t" : "\\\\");
 fs.appendFileSync(events, action + ":" + (agent || "") + "\\n");
 if (action === "check") {
   if (agent === "Busy") console.log("working...\\nGPT-5.6 Sol • low");
@@ -88,6 +91,7 @@ if (action === "check") {
   else if (agent === "Slow") setTimeout(() => console.log("GPT-5.6 Sol • low"), 60000);
   else console.log("~/project GPT-5.6 Sol • low");
 } else if (action === "ask") {
+  fs.writeFileSync(path.join(path.dirname(process.argv[1]), "received-prompt.json"), JSON.stringify(prompt));
   const task = prompt.split("\\n\\nReturn your final reply exactly once")[0];
   const requestId = (prompt.match(/Request ID: ([0-9a-f-]{36})/) || ["", ""])[1];
   const begin = "<<<MAESTRI_REPLY_BEGIN:" + requestId + ">>>";
@@ -257,6 +261,78 @@ async function waitForGroupGone(pgid: number): Promise<void> {
 	throw new Error(`process group remained alive: ${pgid}`);
 }
 
+test("prompt fidelity survives runner and controlled CLI decoding with original digest and replay", async (t) => {
+	const { dir, env, events, tools } = await fixture(t);
+	const prompt = String.raw`C:\tmp\notes literal \n \t \\ \\\\ "quotes" 'single' ` + "`$HOME é 😀\nreal\ttab";
+	const params = { agent: "Farol", prompt, client_request_id: "literal-corpus" };
+	const first = state(await invoke(tools.get("maestri_ask_async")!, params));
+	await waitForTerminal(tools.get("maestri_ask_request")!, first.request_id);
+	assert.equal(JSON.parse(await readFile(path.join(dir, "received-prompt.json"), "utf8")), envelopedPrompt(prompt, first.request_id));
+	const record = JSON.parse(await readFile(path.join(askStateRoot(env), `${first.request_id}.json`), "utf8"));
+	assert.equal(record.prompt_digest, promptDigest(prompt));
+	assert.equal(record.prompt_bytes, Buffer.byteLength(prompt));
+	assert.equal(state(await invoke(tools.get("maestri_ask_async")!, params)).request_id, first.request_id);
+	assert.equal(await eventCount(events, "ask:"), 1);
+	await assert.rejects(invoke(tools.get("maestri_ask_async")!, { ...params, prompt: prompt.replace("\\n", "\n") }), /different agent or prompt/);
+});
+
+test("async accepts an option-looking prompt in the post-agent prompt position", async (t) => {
+	const { dir, tools } = await fixture(t);
+	const started = state(await invoke(tools.get("maestri_ask_async")!, {
+		agent: "Farol", prompt: "--raw", client_request_id: "option-looking-prompt",
+	}));
+	await waitForTerminal(tools.get("maestri_ask_request")!, started.request_id);
+	assert.equal(JSON.parse(await readFile(path.join(dir, "received-prompt.json"), "utf8")), envelopedPrompt("--raw", started.request_id));
+});
+
+test("prompt fidelity rejects encoded envelope overflow before preflight or acceptance", async (t) => {
+	const { env, events, tools } = await fixture(t);
+	// Raw text fits; only encoding plus the request envelope exceeds the limit.
+	await assert.rejects(invoke(tools.get("maestri_ask_async")!, {
+		agent: "Farol", prompt: "\\".repeat(32_768), client_request_id: "encoded-overflow",
+	}), /UTF-8 bytes/);
+	assert.equal(await eventCount(events, "check:"), 0);
+	assert.equal(await eventCount(events, "ask:"), 0);
+	// Recovery is checked first; an invalid new prompt must not create a receipt or dispatch.
+	const root = askStateRoot(env);
+	assert.deepEqual((await readdir(root)).filter((name) => /\.json$|\.out$/.test(name)), []);
+	assert.deepEqual(await readdir(path.join(root, "by-client")), []);
+});
+
+test("recovers historical client keys without applying new wire limits to a prompt that will not be resent", async (t) => {
+	const { env, events, tools } = await fixture(t);
+	const root = await ensureAskStateRoot(env);
+	const prompt = "\\".repeat(32_700);
+	const original = acceptedRecord("historical-wire-limit", prompt, path.basename(root));
+	await createAcceptedRequest(root, original, clientDigest(original.client_request_id));
+	await atomicWriteRecord(root, transitionTerminal(original, {
+		delivery: "confirmed", reply: "received", reason: "envelope-received", termination: null,
+		exitCode: 0, rawBytes: 0, truncated: false,
+	}));
+	const params = { agent: original.agent, prompt, client_request_id: original.client_request_id };
+	const ask = tools.get("maestri_ask_async")!;
+	assert.equal(state(await invoke(ask, params)).request_id, original.request_id);
+	await assert.rejects(invoke(ask, { ...params, prompt: prompt + "different" }), /different agent or prompt/);
+	await assert.rejects(invoke(ask, { ...params, client_request_id: "new-wire-limit" }), /encoded prompt/);
+	assert.equal(await eventCount(events, "check:"), 0);
+	assert.equal(await eventCount(events, "ask:"), 0);
+});
+
+test("prompt fidelity accepts exact encoded envelope limit and JSON-expanded payload", async (t) => {
+	const { dir, tools } = await fixture(t);
+	const overhead = Buffer.byteLength(envelopedPrompt("", "00000000-0000-4000-8000-000000000000"));
+	const budget = 65_536 - overhead;
+	const prompts = ["\\".repeat(Math.floor(budget / 2)) + "a".repeat(budget % 2), "\u0001".repeat(budget)];
+	for (const [index, prompt] of prompts.entries()) {
+		const accepted = state(await invoke(tools.get("maestri_ask_async")!, {
+			agent: "Farol", prompt, client_request_id: `boundary-${index}`,
+		}));
+		const terminal = await waitForTerminal(tools.get("maestri_ask_request")!, accepted.request_id);
+		assert.equal(terminal.delivery, "confirmed");
+		assert.equal(JSON.parse(await readFile(path.join(dir, "received-prompt.json"), "utf8")), envelopedPrompt(prompt, accepted.request_id));
+	}
+});
+
 test("resolves a real Node executable instead of assuming the Pi launcher", async (t) => {
 	const { dir } = await fixture(t);
 	const node = path.join(dir, "node");
@@ -264,6 +340,60 @@ test("resolves a real Node executable instead of assuming the Pi launcher", asyn
 	await chmod(node, 0o700);
 	assert.equal(await resolveNodeExecutable({ PATH: dir }), node);
 	await assert.rejects(resolveNodeExecutable({ PATH: "" }), /Node\.js is unavailable/);
+});
+
+test("reports safe runner startup diagnostics without losing the original receipt or retrying", async (t) => {
+	const { dir, env, events } = await fixture(t);
+	const invalidRunner = path.join(dir, "invalid-runner.mjs");
+	await writeFile(invalidRunner, 'import "./private-async-token-missing.mjs";\n');
+	const tools = registerTools(env, { asyncRunnerPath: invalidRunner, asyncHandshakeTimeoutMs: 1_000, asyncKillGraceMs: 75 });
+	const ask = tools.get("maestri_ask_async")!;
+	const request = tools.get("maestri_ask_request")!;
+	const params = { agent: "Farol", prompt: "reply", client_request_id: "startup-import-error" };
+	const first = await invoke(ask, params);
+	const current = state(first);
+	assert.deepEqual([current.phase, current.delivery, current.reply], ["terminal", "unknown", "unknown"]);
+	assert.match(first.content[0].text, /ERR_MODULE_NOT_FOUND/);
+	assert.equal(first.details.exit_code, 1);
+	assert.equal(first.details.termination, "process-error");
+	for (const action of ["status", "result"]) {
+		const result = await invoke(request, { action, request_id: current.request_id });
+		assert.match(result.content[0].text, /ERR_MODULE_NOT_FOUND/);
+		assert.doesNotMatch(JSON.stringify(result), /private-async-token|invalid-runner\.mjs/);
+	}
+	assert.equal(state(await invoke(ask, params)).request_id, current.request_id);
+	assert.equal(await eventCount(events, "check:"), 1);
+	assert.equal(await eventCount(events, "ask:"), 0);
+	assert.equal((await stat(outputPath(askStateRoot(env), current.request_id))).size, 0);
+});
+
+test("retains startup diagnostics when a large payload loses its pipe before handshake", async (t) => {
+	const { dir, env, events } = await fixture(t);
+	const invalidRunner = path.join(dir, "invalid-large-runner.mjs");
+	await writeFile(invalidRunner, 'import "./private-async-token-missing.mjs";\n');
+	const tools = registerTools(env, { asyncRunnerPath: invalidRunner, asyncHandshakeTimeoutMs: 1_000, asyncKillGraceMs: 75 });
+	const result = await invoke(tools.get("maestri_ask_async")!, {
+		agent: "Farol", prompt: "\u0001".repeat(60_000), client_request_id: "startup-large",
+	});
+	assert.match(result.content[0].text, /ERR_MODULE_NOT_FOUND/);
+	assert.equal(result.details.exit_code, 1);
+	assert.doesNotMatch(JSON.stringify(result), /private-async-token/);
+	assert.equal(await eventCount(events, "ask:"), 0);
+});
+
+test("bounds payload backpressure when a runner never reads its inherited pipe", { timeout: 5_000 }, async (t) => {
+	const { dir, env, events } = await fixture(t);
+	const blockedRunner = path.join(dir, "blocked-input.mjs");
+	await writeFile(blockedRunner, 'import { writeFileSync } from "node:fs";\nwriteFileSync(new URL("./blocked.pid", import.meta.url), String(process.pid));\nsetInterval(() => {}, 1000);\n');
+	const tools = registerTools(env, { asyncRunnerPath: blockedRunner, asyncHandshakeTimeoutMs: 150, asyncKillGraceMs: 75 });
+	const result = await invoke(tools.get("maestri_ask_async")!, {
+		agent: "Farol", prompt: "\u0001".repeat(60_000), client_request_id: "blocked-input",
+	});
+	assert.equal(state(result).phase, "terminal");
+	assert.equal(result.details.reason, "runner-payload-timeout");
+	assert.equal(await eventCount(events, "ask:"), 0);
+	const pid = Number(await readFile(path.join(dir, "blocked.pid"), "utf8"));
+	assert.throws(() => process.kill(-pid, 0));
 });
 
 test("never promotes a live child that does not author the token-bound runner handshake", async (t) => {
@@ -351,7 +481,7 @@ test("returns a durable id quickly, launches once on replay, and cancels without
 });
 
 test("serializes identical client keys across processes", async (t) => {
-	const { dir, env, events, tools } = await fixture(t);
+	const { env, events, tools } = await fixture(t);
 	const childEnv = {
 		...process.env,
 		...env,
@@ -425,7 +555,8 @@ test("abort before acceptance or during handshake never dispatches invisibly", a
 	assert.equal(await eventCount(events, "ask:"), 0);
 
 	const delayed = path.join(path.dirname(events), "abort-handshake.mjs");
-	await writeFile(delayed, `import { createReadStream } from "node:fs";\nfor await (const _ of createReadStream(null, { fd: 3 })) {}\nsetInterval(() => {}, 1000);\n`);
+	const payloadRead = path.join(path.dirname(events), "abort-handshake-ready");
+	await writeFile(delayed, `import { createReadStream, writeFileSync } from "node:fs";\nfor await (const _ of createReadStream(null, { fd: 3 })) {}\nwriteFileSync(${JSON.stringify(payloadRead)}, "ready");\nsetInterval(() => {}, 1000);\n`);
 	const after = new AbortController();
 	const handshakeTools = registerTools({
 		HOME: path.dirname(events),
@@ -435,13 +566,15 @@ test("abort before acceptance or during handshake never dispatches invisibly", a
 		MAESTRI_WORKSPACE_ID: "workspace",
 		MAESTRI_TERMINAL_ID: "terminal-abort",
 		MAESTRI_SOCKET: "/tmp/private-maestri-test.sock",
-	}, { asyncRunnerPath: delayed, asyncHandshakeTimeoutMs: 500, asyncKillGraceMs: 75 });
-	setTimeout(() => after.abort(), 50);
-	const cancelled = state(await invoke(handshakeTools.get("maestri_ask_async")!, {
+	}, { asyncRunnerPath: delayed, asyncHandshakeTimeoutMs: 2_000, asyncKillGraceMs: 75 });
+	const pending = invoke(handshakeTools.get("maestri_ask_async")!, {
 		agent: "Farol",
 		prompt: "reply",
 		client_request_id: "abort-handshake",
-	}, after.signal));
+	}, after.signal);
+	await waitForFile(payloadRead);
+	after.abort();
+	const cancelled = state(await pending);
 	assert.deepEqual([cancelled.phase, cancelled.delivery, cancelled.reply], ["terminal", "not-attempted", "cancelled"]);
 	assert.equal(await eventCount(events, "ask:"), 0);
 });

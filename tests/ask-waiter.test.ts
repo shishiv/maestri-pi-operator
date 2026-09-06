@@ -8,7 +8,6 @@ import { test, type TestContext } from "node:test";
 import {
 	AskRequestNotFoundError,
 	AskRequestRefusalError,
-	askScopeKey,
 	askStateBase,
 	atomicWriteRecord,
 	clientDigest,
@@ -24,11 +23,11 @@ import {
 import {
 	ASK_TERMINAL_ENVELOPE_SCHEMA,
 	canonicalJson,
-	terminalEnvelope,
 	waitForTerminalRequest,
 } from "../src/ask-waiter.ts";
 
-const BIN = new URL("../bin/mpo-extension", import.meta.url).pathname;
+const BIN = new URL("../src/extension-cli.mjs", import.meta.url).pathname;
+const PACKAGE_VERSION = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version as string;
 
 async function fixture(t: TestContext) {
 	const home = await mkdtemp(path.join(tmpdir(), "maestri-ask-waiter-"));
@@ -75,7 +74,7 @@ async function runBin(
 	input = "",
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	return new Promise((resolve) => {
-		const child = spawn(BIN, args, { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(process.execPath, [BIN, ...args], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 		child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -138,7 +137,7 @@ test("re-armed and duplicate waiters emit the same terminal event while timeout 
 		request_id: `sha256:${"4".repeat(64)}`,
 		host_protocol: 1,
 		extension_id: "org.maestri.pi-operator",
-		extension_version: "0.3.0",
+		extension_version: PACKAGE_VERSION,
 		package_digest: `sha256:${"5".repeat(64)}`,
 		capability: "process-event-adapter",
 		capability_version: 1,
@@ -164,7 +163,7 @@ test("plain and adapter modes emit one typed terminal result and no reply body",
 		request_id: `sha256:${"1".repeat(64)}`,
 		host_protocols: [1],
 		extension_id: "org.maestri.pi-operator",
-		extension_version: "0.3.0",
+		extension_version: PACKAGE_VERSION,
 		package_digest: `sha256:${"2".repeat(64)}`,
 		capability: { name: "process-event-adapter", versions: [1], adapter_names: ["maestri-ask"] },
 	};
@@ -176,7 +175,7 @@ test("plain and adapter modes emit one typed terminal result and no reply body",
 		request_id: `sha256:${"3".repeat(64)}`,
 		host_protocol: 1,
 		extension_id: "org.maestri.pi-operator",
-		extension_version: "0.3.0",
+		extension_version: PACKAGE_VERSION,
 		package_digest: `sha256:${"2".repeat(64)}`,
 		capability: "process-event-adapter",
 		capability_version: 1,
@@ -215,7 +214,7 @@ test("refuses invalid, foreign, unscoped, and unsafe request records", async (t)
 		request_id: `sha256:${"6".repeat(64)}`,
 		host_protocol: 1,
 		extension_id: "org.maestri.pi-operator",
-		extension_version: "0.3.0",
+		extension_version: PACKAGE_VERSION,
 		package_digest: `sha256:${"7".repeat(64)}`,
 		capability: "process-event-adapter",
 		capability_version: 1,

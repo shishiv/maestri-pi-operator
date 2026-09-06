@@ -56,6 +56,75 @@ test("accepts only current idle Pi footers including off and minimal thinking", 
 	});
 });
 
+// Captured in the canvas eval before observer.ts's setStatus was removed.
+const evalFooter = "0.0%/1.1M (auto)                                                     gpt-6-astra • low";
+const evalBorder = "─".repeat(86);
+function evalScreen(status: string, draft = "", cwd = "~/maestri-pi-operator (feat/ask-async)"): string {
+	return `${evalBorder}\n${draft}\n${evalBorder}\n${cwd}\n${evalFooter}\n${status}`;
+}
+
+test("accepts one status line based on the empty composer layout, not its text", () => {
+	for (const status of ["", "Workspace indexed", "Review mode · enabled", "arbitrary text", "native · native", "cli-a · skill-cli", "cli-b · skill-cli"]) {
+		const result = classifyPiReadiness(snapshot({ screen: evalScreen(status) }));
+		assert.equal(result.verdict, "ready", status);
+		if (result.verdict === "ready") assert.equal(result.evidence, evalFooter);
+	}
+});
+
+test("status support cannot hide drafts, busy, shells, truncation, or multiple trailing lines", () => {
+	for (const screen of [
+		evalScreen("native · native", "unsent prompt"),
+		evalScreen("", "unsent prompt"),
+		evalScreen("native · native", "first line\nsecond line"),
+		evalScreen("native · native\nunknown extension status"),
+		evalScreen("native · native\nnative · native"),
+		`${evalFooter}\nnative · native`,
+		evalScreen("native · native").replace(evalFooter, `${evalFooter} garbage`),
+		evalScreen("native · native").replace(evalFooter, "gpt-6-astra garbage"),
+		evalScreen("native · native").replace(evalFooter, `${evalFooter}\nGPT-6 Astra • high`),
+		evalScreen("native · native\nuser@host:~/repo $"),
+		evalScreen("native · native\nPS C:\\repo>"),
+		evalScreen("native · native\n⠴ Working"),
+		`⠴ Working\n${evalScreen("native · native")}`,
+	]) assert.notEqual(classifyPiReadiness(snapshot({ screen })).verdict, "ready", screen);
+	assert.equal(classifyPiReadiness(snapshot({ screen: evalScreen("native · native"), truncated: true })).verdict, "unsupported");
+	assert.equal(classifyPiReadiness(snapshot({ screen: evalScreen("native · native"), terminal_type: "shell" })).verdict, "unsupported");
+});
+
+test("does not mistake a draft separator for the structural composer border", () => {
+	for (const status of ["", "Workspace indexed"]) {
+		for (const draft of ["unsent task\n───\n", ` unsent task\n ${evalBorder}\n `]) {
+			assert.notEqual(classifyPiReadiness(snapshot({ screen: evalScreen(status, draft) })).verdict, "ready");
+		}
+	}
+});
+
+test("accepts the Pi footer when the working directory is HOME", () => {
+	for (const cwd of ["~", "~ (main)", "~ • named session", "~ (main) • named session"]) {
+		for (const status of ["", "Workspace indexed"]) {
+			assert.equal(classifyPiReadiness(snapshot({ screen: evalScreen(status, "", cwd) })).verdict, "ready", `${cwd} / ${status}`);
+		}
+	}
+});
+
+test("rejects a status tail without a complete empty composer and directory layout", () => {
+	for (const status of ["Workspace indexed", "Review mode · enabled"]) {
+		for (const screen of [
+			`${evalFooter}\n${status}`,
+			`${evalBorder}\n\n~/repo\n${evalFooter}\n${status}`,
+			`${evalBorder}\n${evalBorder}\n~/repo\n${evalFooter}\n${status}`,
+			`${evalBorder}\n\n${evalBorder}\n${evalFooter}\n${status}`,
+			`${evalBorder}\n\n${evalBorder}\nnot a directory\n${evalFooter}\n${status}`,
+			`${evalBorder}\n\n${evalBorder}\n~/repo\nextra line\n${evalFooter}\n${status}`,
+			evalScreen(`${status}\nadditional status`),
+			evalScreen(status, "unsent draft"),
+			evalScreen("⠴ Working"),
+			evalScreen("user@host:~/repo $"),
+			evalScreen("GPT-6 Astra • high"),
+		]) assert.notEqual(classifyPiReadiness(snapshot({ screen })).verdict, "ready", screen);
+	}
+});
+
 test("rejects unsupported, incomplete, blank, and stale captures before content claims", () => {
 	assert.deepEqual(classifyPiReadiness(snapshot({ terminal_type: "shell" })), {
 		verdict: "unsupported",

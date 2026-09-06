@@ -4,6 +4,25 @@ Este pacote fornece transporte, não operação. Avalie as ferramentas de agente
 notas, roles e portais, o ciclo de vida async, o notificador e o waiter. O recon do app
 Maestri inteiro é outro escopo. Não restaure skills, princípios ou setup de canvas.
 
+Estabilidade e robustez são os critérios de aceite. Latência é observação
+secundária, não compensação para falha, perda de texto ou reenvio indevido.
+
+## Camadas de prova
+
+- `npm run check`: contratos locais e teste do tarball instalado. O build é
+  automático; não usar dist antigo como evidência de uma fonte nova.
+- Pacote instalado: diretório real em node_modules, sem symlink para o checkout.
+  Conferir o digest do mesmo tarball usado no teste e na jornada real. O teste
+  de runner com CLI controlado não certifica o loader Pi ou o app Maestri.
+  O gate usa cache npm vazio e peers declarados da instalação de desenvolvimento;
+  não deve depender de downloads ou de metadata guardada no cache do operador.
+- Integração real: Pi/Maestri, permissões e fixtures próprias. Confirmar que o
+  destinatário recebeu a tarefa antes de declarar trabalho iniciado. Registrar
+  ausência de Maestro/SDK/dispositivo como BLOCKED, não PASS.
+
+Preservar a primeira falha e seu diagnóstico. Não repetir até ficar verde,
+transformar bloqueio em sucesso ou contar uma ação de portal como prova de todas.
+
 ## Instância e fixtures
 
 - Use um terminal Maestri conectado. Confira `maestri list` e os nomes reais antes
@@ -25,9 +44,15 @@ Maestri inteiro é outro escopo. Não restaure skills, princípios ou setup de c
    com respostas anteriores ainda visíveis na tela.
 3. Resultado pendente sem conteúdo parcial, replay pela mesma chave, conflito
    de payload e exclusão de outro pedido ativo no mesmo agente.
+   Incluir recibo antigo cujo prompt excede o novo limite codificado: recuperação
+   deve funcionar sem reenvio; uma nova chave deve ser recusada antes do efeito.
+   Confirmar que o recibo estruturado não contém o prompt. Tratar a captura privada
+   como potencial portadora do texto renderizado; não usar segredos na fixture.
 4. Cancelamento, descarte de parcial e consulta posterior sem reenvio implícito.
 5. Encerramento do chamador enquanto o runner trabalha, recuperação do mesmo
    pedido, notificação em Pi real, reanúncio sem ack e supressão depois do ack.
+   Incluir conclusão enquanto o chamador está busy, passagem a idle e consumo
+   automático de result, sem um prompt manual do coordenador.
 6. Isolamento por workspace e terminal. Nunca altere recibos de trabalho real
    para simular outra identidade ou crash.
 7. Role list, show e create com escopo local. Note create, read com intervalos,
@@ -48,6 +73,14 @@ Maestri inteiro é outro escopo. Não restaure skills, princípios ou setup de c
     Não repita interações falhas sem inspecionar o estado. Não feche o portal sem pedido.
 14. Dispositivo real exige Android SDK e alvo disponível. A recusa sem SDK é prova
     de erro de ambiente, não PASS de uma jornada Android. Não instale SDK implicitamente.
+15. Fidelidade sync/async após a decodificação do CLI: barras literais, newline/tab
+    reais, Unicode e limite codificado. Comparar conteúdo recebido, não só argv.
+16. Importação inválida e backpressure do payload antes do handshake: prazo finito,
+    diagnóstico sanitizado, custódia reconciliada e nenhum reenvio automático.
+17. Readiness com status e composer vazio; recusar rascunho inclusive contendo
+    separadores que parecem bordas, além de busy, shell e captura ambígua.
+18. Falha de leitura do journal em scan agendado: aviso sem dados sensíveis,
+    nenhuma rejeição não tratada, nenhum ack falso e recuperação em evento posterior.
 
 Leia o diff de cada rodada e acrescente os casos novos. Um teste unitário verde
 não substitui uma jornada de integração. Registre separadamente casos ao vivo,

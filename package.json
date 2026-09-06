@@ -1,6 +1,6 @@
 {
   "name": "maestri-pi-operator",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Native Maestri transport tools for Pi.",
   "type": "module",
   "engines": {
@@ -13,26 +13,37 @@
     "mpo-extension": "./bin/mpo-extension"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./readiness": "./src/readiness.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./readiness": {
+      "types": "./dist/readiness.d.ts",
+      "default": "./dist/readiness.js"
+    }
   },
   "files": [
     "README.md",
     "bin",
     "docs",
     "firstmate-extension.json",
-    "src"
+    "dist"
   ],
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "pretest": "npm run build",
     "test": "node --test --test-concurrency=1 tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
+    "presmoke": "npm run build",
     "smoke": "bash tests/smoke-v01.sh --fake",
+    "presmoke:live": "npm run build",
     "smoke:live": "bash tests/smoke-v01.sh --live"
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   },
   "peerDependencies": {

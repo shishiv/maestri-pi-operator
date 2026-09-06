@@ -30,10 +30,13 @@ class AskNotifier {
 	private readonly owner: { pid: number; identity: ProcessIdentity };
 	private readonly readIdentity: typeof readProcessIdentity;
 	private readonly watchFactory: NonNullable<AskNotifierOptions["watch"]>;
+	private readonly reportFailure: () => void;
 	private watcher: Pick<FSWatcher, "close"> | null = null;
 	private timer: NodeJS.Timeout | null = null;
-	private scanning = false;
+	private scanning: Promise<void> | null = null;
+	private rescanRequested = false;
 	private stopped = false;
+	private failureReported = false;
 
 	constructor(
 		pi: ExtensionAPI,
@@ -42,6 +45,7 @@ class AskNotifier {
 		owner: { pid: number; identity: ProcessIdentity },
 		readIdentity: typeof readProcessIdentity,
 		watchFactory: NonNullable<AskNotifierOptions["watch"]>,
+		reportFailure: () => void,
 	) {
 		this.pi = pi;
 		this.ctx = ctx;
@@ -49,6 +53,7 @@ class AskNotifier {
 		this.owner = owner;
 		this.readIdentity = readIdentity;
 		this.watchFactory = watchFactory;
+		this.reportFailure = reportFailure;
 	}
 
 	start(): void {
@@ -64,15 +69,23 @@ class AskNotifier {
 	}
 
 	async scan(): Promise<void> {
-		if (this.stopped || this.scanning || !this.ctx.isIdle()) return;
-		this.scanning = true;
+		if (this.stopped || !this.ctx.isIdle()) return;
+		if (this.scanning) {
+			this.rescanRequested = true;
+			return;
+		}
+		let finish = () => {};
+		this.scanning = new Promise<void>((resolve) => { finish = resolve; });
 		try {
 			for (const record of (await listRequests(this.root)).slice(0, 256)) {
+				if (this.stopped || !this.ctx.isIdle()) return;
 				if (record.phase !== "terminal" || record.notification.state === "acked") continue;
 				const key = `${record.request_id}:${record.notification.digest ?? "pending"}`;
 				if (this.attempted.has(key)) continue;
 				const claimed = await this.claim(record.request_id);
 				if (!claimed) continue;
+				// Lock/identity IO can outlive idle or session shutdown. A claim is not a send.
+				if (this.stopped || !this.ctx.isIdle()) return;
 				const envelope = terminalEnvelope(claimed);
 				this.attempted.add(`${claimed.request_id}:${envelope.digest}`);
 				try {
@@ -92,17 +105,31 @@ class AskNotifier {
 					await this.markFailed(claimed.request_id, envelope.digest);
 				}
 			}
+			this.failureReported = false;
+		} catch {
+			// Scheduled scans have no awaiting Pi event handler to contain a rejection.
+			if (!this.stopped && !this.failureReported) {
+				this.failureReported = true;
+				this.reportFailure();
+			}
 		} finally {
-			this.scanning = false;
+			this.scanning = null;
+			finish();
+			if (this.rescanRequested) {
+				this.rescanRequested = false;
+				this.schedule();
+			}
 		}
 	}
 
-	stop(): void {
+	async stop(): Promise<void> {
 		this.stopped = true;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = null;
 		this.watcher?.close();
 		this.watcher = null;
+		// A sent notification still needs its durable write before session teardown.
+		await this.scanning;
 	}
 
 	private async claim(requestId: string) {
@@ -172,14 +199,18 @@ export function registerAskNotifier(pi: ExtensionAPI, options: AskNotifierOption
 	let notifier: AskNotifier | null = null;
 
 	pi.on("session_start", async (_event, ctx) => {
-		notifier?.stop();
+		await notifier?.stop();
 		const root = await ensureAskStateRoot(env).catch(() => null);
 		if (!root) return;
 		const owner = options.owner ?? await readIdentity(process.pid).then((identity) => identity
 			? { pid: process.pid, identity: identity.identity }
 			: null).catch(() => null);
 		if (!owner) return;
-		notifier = new AskNotifier(pi, ctx, root, owner, readIdentity, watchFactory);
+		notifier = new AskNotifier(pi, ctx, root, owner, readIdentity, watchFactory, () => {
+			const message = "Maestri reply notifications could not read or update the request journal. Inspect the original request IDs with maestri_ask_request; do not resend prompts. Notification checks resume on the next event.";
+			if (ctx.hasUI) ctx.ui.notify(message, "warning");
+			else console.error(message);
+		});
 		notifier.start();
 		await notifier.scan();
 	});
@@ -188,8 +219,14 @@ export function registerAskNotifier(pi: ExtensionAPI, options: AskNotifierOption
 		await notifier?.scan();
 	});
 
+	// agent_end may still be busy while Pi retries, compacts, or drains follow-ups.
+	// settled is the idle edge; scan still checks for a run started by another extension.
+	pi.on("agent_settled", async () => {
+		await notifier?.scan();
+	});
+
 	pi.on("session_shutdown", async () => {
-		notifier?.stop();
+		await notifier?.stop();
 		notifier = null;
 	});
 }

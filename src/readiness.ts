@@ -48,6 +48,7 @@ const BUSY = [
 	/^\s*Running\.\.\.\s*\(/i,
 ];
 const SHELL_PROMPT = /^(?:PS\s+)?[^\r\n]*(?:[#$%>]|❯|➜)\s*$/;
+const COMPOSER_BORDER = /^─{3,}\s*$/;
 
 function normalizeScreen(screen: string): string {
 	return stripVTControlCharacters(screen)
@@ -76,10 +77,9 @@ export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 	const age = staleAge(snapshot);
 	if (age !== null) return { verdict: "stale", age_ms: age };
 
-	const lines = normalizeScreen(snapshot.screen)
-		.split("\n")
-		.map((line) => line.trim())
-		.filter(Boolean);
+	const rawLines = normalizeScreen(snapshot.screen).split("\n");
+	const screenLines = rawLines.map((line) => line.trim());
+	const lines = screenLines.filter(Boolean);
 	if (lines.length === 0) return { verdict: "blank" };
 
 	const footers = lines.flatMap((line) => {
@@ -98,7 +98,29 @@ export function classifyPiReadiness(snapshot: ReadinessSnapshot): Readiness {
 	const last = lines.at(-1) as string;
 	if (SHELL_PROMPT.test(last)) return { verdict: "shell", evidence: last };
 	const footer = footers[0];
-	if (!footer || footer.line !== last) return { verdict: "unsupported", reason: "unknown-surface" };
+	if (!footer) return { verdict: "unsupported", reason: "unknown-surface" };
+	const footerIndex = screenLines.indexOf(footer.line);
+	const trailing = screenLines.slice(footerIndex + 1).filter(Boolean);
+	// The TUI reserves one line below the footer for status. Its text cannot
+	// authenticate readiness; accepting it requires the empty composer layout below.
+	if (trailing.length > 1) {
+		return { verdict: "unsupported", reason: "unknown-surface" };
+	}
+
+	// Keep blank rows until checking the composer: filtering them first hides drafts.
+	const beforeFooter = screenLines.slice(0, footerIndex);
+	const borders = rawLines.slice(0, footerIndex).flatMap((line, index) => COMPOSER_BORDER.test(line) ? [index] : []);
+	const bottom = borders.at(-1);
+	const top = borders.at(-2);
+	if (beforeFooter.some((line) => COMPOSER_BORDER.test(line)) || trailing.length > 0) {
+		const belowComposer = bottom === undefined ? [] : beforeFooter.slice(bottom + 1).filter(Boolean);
+		if (top === undefined || bottom === undefined || bottom <= top + 1
+			|| rawLines[top].trimEnd() !== rawLines[bottom].trimEnd()
+			|| beforeFooter.slice(top + 1, bottom).some(Boolean)
+			|| belowComposer.length !== 1 || !/^(?:~(?:$|\/|\s+(?:\(|•))|\/)/.test(belowComposer[0])) {
+			return { verdict: "unsupported", reason: "unknown-surface" };
+		}
+	}
 
 	const model = (footer.match[1] === "gpt-6-astra"
 		? "Astra"

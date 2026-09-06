@@ -1,7 +1,7 @@
 {
   "schema": "firstmate.extension-manifest.v1",
   "id": "org.maestri.pi-operator",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "host_protocols": [1],
   "entrypoint": "bin/mpo-extension",
   "capabilities": [

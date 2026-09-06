@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, open, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import type { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -51,6 +52,8 @@ import {
 import { classifyPiReadiness } from "./readiness.ts";
 import { envelopedPrompt, extractReplyEnvelope } from "./reply-envelope.ts";
 import { terminalEnvelope } from "./ask-terminal.ts";
+import { assertAskPrompt, MAX_PROMPT_BYTES } from "./cli-text.ts";
+import { redactSensitiveText } from "./output.ts";
 
 export const MAESTRI_ASYNC_PREFLIGHT_TIMEOUT_MS = 10_000;
 export const MAESTRI_ASYNC_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -372,6 +375,47 @@ async function rememberLaunchedChild(
 	return runner;
 }
 
+function writeRunnerPayload(input: Writable, payload: string, deadline: number, signal?: AbortSignal) {
+	return new Promise<"written" | "failed" | "timed-out" | "cancelled">((resolve) => {
+		let settled = false;
+		const finish = (result: "written" | "failed" | "timed-out" | "cancelled") => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			resolve(result);
+		};
+		const abort = () => finish("cancelled");
+		const error = () => finish("failed");
+		const timer = setTimeout(() => finish("timed-out"), Math.max(0, deadline - Date.now()));
+		// A timeout leaves a pending write until process cleanup; keep its error observed.
+		input.once("error", error);
+		input.once("close", () => input.removeListener("error", error));
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) return abort();
+		try { input.end(payload, () => finish("written")); } catch { finish("failed"); }
+	});
+}
+
+async function runnerStartupFailure(
+	root: string,
+	requestId: string,
+	child: ReturnType<typeof spawn>,
+): Promise<Pick<NonNullable<AskRequestRecord["terminal"]>, "reason" | "termination" | "exit_code">> {
+	if (child.exitCode === null && child.signalCode === null) {
+		return { reason: "runner-handshake-timeout", termination: "launch-unknown", exit_code: null };
+	}
+	// Never expose startup stderr or paths as a peer reply. Keep only known runtime codes.
+	const output = await readOutput(root, requestId).then((bytes) => bytes.toString("utf8"), () => "");
+	const code = ["ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING", "ERR_MODULE_NOT_FOUND", "ERR_UNKNOWN_FILE_EXTENSION", "ERR_REQUIRE_ESM", "MODULE_NOT_FOUND"]
+		.find((candidate) => output.includes(candidate));
+	return {
+		reason: code ? `runner-startup:${code}` : "runner-startup-failed",
+		termination: "process-error",
+		exit_code: child.exitCode,
+	};
+}
+
 async function launchRunner(
 	root: string,
 	record: AskRequestRecord,
@@ -393,6 +437,7 @@ async function launchRunner(
 	await createOutput(root, record.request_id);
 	const output = await open(outputPath(root, record.request_id), fsConstants.O_WRONLY | fsConstants.O_APPEND);
 	let child: ReturnType<typeof spawn>;
+	let spawnFailed = false;
 	try {
 		child = spawn(nodeCommand, [runnerPath, root, record.request_id, token], {
 			cwd,
@@ -402,30 +447,24 @@ async function launchRunner(
 			stdio: ["ignore", output.fd, output.fd, "pipe"],
 			windowsHide: true,
 		});
+		child.once("error", () => { spawnFailed = true; });
 	} catch {
 		await output.close();
 		return markLaunchFailure(root, record.request_id, "runner-spawn-failed");
 	}
 	await output.close();
 	const launched = await rememberLaunchedChild(root, record.request_id, child.pid, readIdentity);
-	let spawnFailed = false;
-	child.once("error", () => {
-		spawnFailed = true;
-	});
 	const input = child.stdio[3];
 	if (!input || !("end" in input)) {
 		return markLaunchFailure(root, record.request_id, "runner-input-unavailable");
 	}
-	try {
-		await new Promise<void>((resolve, reject) => {
-			input.once("error", reject);
-			input.end(JSON.stringify({ token, command, cwd, agent: record.agent, prompt, askTimeoutMs, killGraceMs }), resolve);
-		});
-	} catch {
-		return markLaunchFailure(root, record.request_id, "runner-input-failed");
+	const deadline = Date.now() + handshakeTimeoutMs;
+	const written = await writeRunnerPayload(input,
+		JSON.stringify({ token, command, cwd, agent: record.agent, prompt, askTimeoutMs, killGraceMs }), deadline, signal);
+	if (written === "cancelled") {
+		return cancelDuringHandshake(root, record.request_id, child.pid, killGraceMs, readIdentity, cancelProcessGroup);
 	}
 	child.unref();
-	const deadline = Date.now() + handshakeTimeoutMs;
 	while (Date.now() < deadline && !spawnFailed) {
 		if (signal?.aborted) {
 			return cancelDuringHandshake(root, record.request_id, child.pid, killGraceMs, readIdentity, cancelProcessGroup);
@@ -437,7 +476,12 @@ async function launchRunner(
 			}
 			return current;
 		}
+		if (child.exitCode !== null || child.signalCode !== null) break;
 		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	const failure = await runnerStartupFailure(root, record.request_id, child);
+	if (failure.reason === "runner-handshake-timeout" && written !== "written") {
+		failure.reason = written === "timed-out" ? "runner-payload-timeout" : "runner-input-failed";
 	}
 	let observed: NonNullable<AskRequestRecord["runner"]> | undefined = launched;
 	let uncertain = false;
@@ -462,14 +506,14 @@ async function launchRunner(
 		if (observed || uncertain) {
 			const orphan = transitionOrphan(
 				current,
-				"runner-handshake-timeout",
+				failure.reason,
 				observed,
 				Date.now() + killGraceMs + 5_000,
 			);
 			await atomicWriteRecord(root, orphan);
 			return orphan;
 		}
-		const failed = terminalRecord(current, "unknown", "unknown", "runner-handshake-timeout", "launch-unknown", null, 0, true);
+		const failed = terminalRecord(current, "unknown", "unknown", failure.reason, failure.termination, failure.exit_code, 0, true);
 		await discardOutput(root, record.request_id);
 		await atomicWriteRecord(root, failed);
 		return failed;
@@ -480,7 +524,7 @@ async function launchRunner(
 	return withRequestLock(root, record.request_id, async () => {
 		const current = await readRequest(root, record.request_id);
 		if (current.phase === "terminal") return current;
-		const failed = terminalRecord(current, "unknown", "unknown", "runner-handshake-timeout", "launch-unknown", null, 0, true);
+		const failed = terminalRecord(current, "unknown", "unknown", failure.reason, failure.termination, failure.exit_code, 0, true);
 		await discardOutput(root, record.request_id);
 		await atomicWriteRecord(root, failed);
 		return failed;
@@ -508,7 +552,6 @@ async function acceptAsyncRequest(
 	assertAgent(agent);
 	assertPrompt(prompt);
 	assertClientRequestId(clientRequestId);
-	if (prompt.startsWith("-")) throw new Error("prompt must not start with '-' because Maestri may parse it as an option");
 	const root = await ensureAskStateRoot(env);
 	const scopeKey = askScopeKey(env);
 	const digest = clientDigest(clientRequestId);
@@ -526,12 +569,14 @@ async function acceptAsyncRequest(
 		return null;
 	});
 	if (replay) return reconcileRequest(root, replay.request_id, readIdentity);
+	const requestId = randomUUID();
+	const runnerPrompt = envelopedPrompt(prompt, requestId);
+	assertAskPrompt(runnerPrompt);
 	const command = await resolveMaestriCli(env, platform);
 	const nodeCommand = await resolveNodeExecutable(env);
 	await preflightReady(execute, command, agent, cwd, env, platform, signal, preflightTimeoutMs);
 	if (signal?.aborted) throw new Error("maestri_ask_async was cancelled before request acceptance");
 	let runnerToken: string | undefined;
-	let runnerPrompt: string | undefined;
 	const result = await withFileLock(lockPath(root, "create"), async () => {
 		await assertRequestInScope(env, { clientKeyDigest: digest });
 		const existing = await mappedRequest(root, digest);
@@ -551,9 +596,6 @@ async function acceptAsyncRequest(
 		if (signal?.aborted) throw new Error("maestri_ask_async was cancelled before request acceptance");
 		const now = new Date().toISOString();
 		runnerToken = randomUUID();
-		const requestId = randomUUID();
-		runnerPrompt = envelopedPrompt(prompt, requestId);
-		assertPrompt(runnerPrompt);
 		const record: AskRequestRecord = {
 			schema: 1,
 			scope_key: scopeKey,
@@ -750,6 +792,17 @@ async function acknowledgeTerminalNotification(root: string, requestId: string):
 	});
 }
 
+function visibleState(record: AskRequestRecord, env: Environment) {
+	return {
+		...requestState(record),
+		...(record.phase === "terminal" && record.terminal ? {
+			reason: redactSensitiveText(record.terminal.reason, env).slice(0, 160),
+			termination: record.terminal.termination,
+			exit_code: record.terminal.exit_code,
+		} : {}),
+	};
+}
+
 function stateResult(action: string, state: AskRequestState, refusal?: string): AsyncToolResult {
 	const value = refusal ? { ...state, refusal } : state;
 	return {
@@ -771,10 +824,10 @@ async function requestAction(
 	await assertRequestInScope(env, { requestId });
 	if (action === "cancel") {
 		const cancelled = await cancelRequest(root, requestId, killGraceMs, cancelProcessGroup, readIdentity);
-		return stateResult(action, requestState(cancelled.record), cancelled.refusal);
+		return stateResult(action, visibleState(cancelled.record, env), cancelled.refusal);
 	}
 	const record = await reconcileRequest(root, requestId, readIdentity);
-	let state = requestState(record);
+	let state = visibleState(record, env);
 	if (action !== "result" || record.phase !== "terminal") return stateResult(action, state);
 	const output = await readResultOutput(root, record);
 	const envelope = extractReplyEnvelope(output, requestId);
@@ -822,7 +875,7 @@ export function registerMaestriAsyncTools(pi: ExtensionAPI, options: MaestriAsyn
 		],
 		parameters: Type.Object({
 			agent: Type.String({ minLength: 1, maxLength: 128 }),
-			prompt: Type.String({ minLength: 1, maxLength: 65_536 }),
+			prompt: Type.String({ minLength: 1, maxLength: MAX_PROMPT_BYTES }),
 			client_request_id: Type.String({ minLength: 1, maxLength: MAX_CLIENT_REQUEST_ID_BYTES }),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -843,7 +896,7 @@ export function registerMaestriAsyncTools(pi: ExtensionAPI, options: MaestriAsyn
 				readIdentity,
 				cancelProcessGroup,
 			);
-			return stateResult("ask_async", requestState(record));
+			return stateResult("ask_async", visibleState(record, env));
 		},
 	});
 
