@@ -24,6 +24,7 @@ type NotifierContext = { isIdle(): boolean };
 
 class AskNotifier {
 	private readonly attempted = new Set<string>();
+	private readonly failed = new Set<string>();
 	private readonly pi: ExtensionAPI;
 	private readonly ctx: NotifierContext;
 	private readonly root: string;
@@ -80,7 +81,7 @@ class AskNotifier {
 			for (const record of (await listRequests(this.root)).slice(0, 256)) {
 				if (this.stopped || !this.ctx.isIdle()) return;
 				if (record.phase !== "terminal" || record.notification.state === "acked") continue;
-				const key = `${record.request_id}:${record.notification.digest ?? "pending"}`;
+				const key = `${record.request_id}:${terminalEnvelope(record).digest}`;
 				if (this.attempted.has(key)) continue;
 				const claimed = await this.claim(record.request_id);
 				if (!claimed) continue;
@@ -102,6 +103,7 @@ class AskNotifier {
 					}, { deliverAs: "followUp", triggerTurn: true });
 					await this.markSent(claimed.request_id, envelope.digest);
 				} catch {
+					this.failed.add(key);
 					await this.markFailed(claimed.request_id, envelope.digest);
 				}
 			}
@@ -120,6 +122,11 @@ class AskNotifier {
 				this.schedule();
 			}
 		}
+	}
+
+	retryFailed(): void {
+		for (const key of this.failed) this.attempted.delete(key);
+		this.failed.clear();
 	}
 
 	async stop(): Promise<void> {
@@ -186,6 +193,7 @@ class AskNotifier {
 					...record.notification,
 					state: "pending",
 					attempts: record.notification.attempts + 1,
+					claim: null,
 				},
 			});
 		});
@@ -222,6 +230,7 @@ export function registerAskNotifier(pi: ExtensionAPI, options: AskNotifierOption
 	// agent_end may still be busy while Pi retries, compacts, or drains follow-ups.
 	// settled is the idle edge; scan still checks for a run started by another extension.
 	pi.on("agent_settled", async () => {
+		notifier?.retryFailed();
 		await notifier?.scan();
 	});
 

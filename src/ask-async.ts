@@ -658,7 +658,9 @@ async function cancelRequest(
 	killGraceMs: number,
 	cancelProcessGroup: NonNullable<MaestriAsyncRuntimeOptions["asyncCancelProcessGroup"]>,
 	readIdentity: typeof readProcessIdentity,
+	signal?: AbortSignal,
 ): Promise<{ record: AskRequestRecord; refusal?: string }> {
+	signal?.throwIfAborted();
 	let runner: NonNullable<AskRequestRecord["runner"]> | undefined;
 	const prepared = await withRequestLock(root, requestId, async () => {
 		const record = await readRequest(root, requestId);
@@ -699,6 +701,7 @@ async function cancelRequest(
 			await atomicWriteRecord(root, terminal);
 			return { record: terminal, refusal: "Process identity did not match; no signal was sent" };
 		}
+		signal?.throwIfAborted();
 		runner = record.runner;
 		const cancelling = transitionCancelling(record, Date.now() + killGraceMs + 5_000);
 		await atomicWriteRecord(root, cancelling);
@@ -818,12 +821,14 @@ async function requestAction(
 	killGraceMs: number,
 	cancelProcessGroup: NonNullable<MaestriAsyncRuntimeOptions["asyncCancelProcessGroup"]>,
 	readIdentity: typeof readProcessIdentity,
+	signal?: AbortSignal,
 ): Promise<AsyncToolResult> {
 	assertRequestId(requestId);
 	const root = await ensureAskStateRoot(env);
 	await assertRequestInScope(env, { requestId });
 	if (action === "cancel") {
-		const cancelled = await cancelRequest(root, requestId, killGraceMs, cancelProcessGroup, readIdentity);
+		signal?.throwIfAborted();
+		const cancelled = await cancelRequest(root, requestId, killGraceMs, cancelProcessGroup, readIdentity, signal);
 		return stateResult(action, visibleState(cancelled.record, env), cancelled.refusal);
 	}
 	const record = await reconcileRequest(root, requestId, readIdentity);
@@ -832,6 +837,7 @@ async function requestAction(
 	const output = await readResultOutput(root, record);
 	const envelope = extractReplyEnvelope(output, requestId);
 	const extracted = record.reply === "received" && envelope.reply === "received";
+	const outputKind = extracted ? "extracted-reply" : record.terminal?.termination != null ? "discarded" : "full-capture-evidence";
 	if (record.reply === "received" && !extracted) state = { ...state, reply: "unknown" };
 	const formatted = formatMaestriOutput({
 		stdout: extracted ? envelope.content : output,
@@ -842,11 +848,11 @@ async function requestAction(
 			? "process-error"
 			: record.terminal?.termination ?? null,
 		totalOutputBytes: record.output.raw_bytes,
-	}, env, JSON.stringify({ ...state, output: extracted ? "extracted-reply" : "full-capture-evidence" }));
+	}, env, JSON.stringify({ ...state, output: outputKind }));
 	await acknowledgeTerminalNotification(root, requestId);
 	return {
 		content: [{ type: "text", text: formatted.text }],
-		details: { action, ...state, outputKind: extracted ? "extracted-reply" : "full-capture-evidence", ...formatted.details },
+		details: { action, ...state, outputKind, ...formatted.details },
 	};
 }
 
@@ -912,9 +918,9 @@ export function registerMaestriAsyncTools(pi: ExtensionAPI, options: MaestriAsyn
 			action: Type.String({ enum: ["status", "result", "cancel"] }),
 			request_id: Type.String({ minLength: 36, maxLength: 36 }),
 		}, { additionalProperties: false }),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			if (!["status", "result", "cancel"].includes(params.action)) throw new Error("action must be status, result, or cancel");
-			return requestAction(params.action, params.request_id, env, killGraceMs, cancelProcessGroup, readIdentity);
+			return requestAction(params.action, params.request_id, env, killGraceMs, cancelProcessGroup, readIdentity, signal);
 		},
 	});
 }

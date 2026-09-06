@@ -23,7 +23,7 @@ import { waitForTerminalRequest } from "../src/ask-waiter.ts";
 
 type Handler = (event: unknown, ctx: { isIdle(): boolean }) => unknown;
 
-function fakePi(sendFails = false, onSend: () => void = () => {}) {
+function fakePi(sendFails: boolean | (() => boolean) = false, onSend: () => void = () => {}) {
 	const handlers = new Map<string, Handler[]>();
 	const messages: Array<{ message: unknown; options: unknown }> = [];
 	const pi = {
@@ -34,7 +34,7 @@ function fakePi(sendFails = false, onSend: () => void = () => {}) {
 		},
 		registerTool() {},
 		sendMessage(message: unknown, options: unknown) {
-			if (sendFails) throw new Error("send failed");
+			if (typeof sendFails === "function" ? sendFails() : sendFails) throw new Error("send failed");
 			messages.push({ message, options });
 			onSend();
 		},
@@ -344,4 +344,35 @@ test("send failure stays pending and finite waiter never mutates notification st
 	const envelope = await waitForTerminalRequest(env, completed.request_id, 10, 2);
 	assert.ok(envelope);
 	assert.equal(JSON.stringify((await readRequest(root, completed.request_id)).notification), before);
+});
+
+test("a synchronous send failure releases its claim and retries on the next idle event", async (t) => {
+	const { env, root } = await fixture(t);
+	const completed = await terminal(root);
+	let fail = true;
+	const flaky = fakePi(() => fail);
+	const ctx = { isIdle: () => true };
+	let changed = () => {};
+	registerAskNotifier(flaky.pi, {
+		...notifierOptions(env, owner(402), () => {}),
+		watch: (_path, listener) => { changed = listener; return { close() {} }; },
+	});
+	t.after(() => flaky.emit("session_shutdown", ctx));
+
+	await flaky.emit("session_start", ctx);
+	const pending = await readRequest(root, completed.request_id);
+	assert.equal(pending.notification.state, "pending");
+	assert.equal(pending.notification.attempts, 1);
+	assert.equal(pending.notification.claim, null);
+	assert.equal(flaky.messages.length, 0);
+	changed();
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal((await readRequest(root, completed.request_id)).notification.attempts, 1);
+
+	fail = false;
+	await flaky.emit("agent_settled", ctx);
+	const sent = await readRequest(root, completed.request_id);
+	assert.equal(sent.notification.state, "sent");
+	assert.equal(sent.notification.attempts, 2);
+	assert.equal(flaky.messages.length, 1);
 });

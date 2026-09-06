@@ -912,6 +912,7 @@ test("caps raw output and returns only sanitized untrusted terminal output", asy
 	assert.equal(terminal.delivery, "unknown");
 	assert.equal(terminal.reply, "unknown");
 	const capped = await invoke(request, { action: "result", request_id: noisy.request_id });
+	assert.equal(capped.details.outputKind, "discarded");
 	assert.match(capped.content[0].text, /UNTRUSTED PEER OUTPUT/);
 	assert.match(capped.content[0].text, /partial output was discarded/);
 	assert.ok(Buffer.byteLength(capped.content[0].text) <= 50 * 1024);
@@ -936,6 +937,7 @@ test("times out and kills a TERM-ignoring process group without exposing partial
 	assert.throws(() => process.kill(descendant, 0));
 	await waitForGroupGone(record.runner.pgid);
 	const result = await invoke(request, { action: "result", request_id: accepted.request_id });
+	assert.equal(result.details.outputKind, "discarded");
 	assert.doesNotMatch(result.content[0].text, /github_pat_|PARTIAL_SECRET/);
 	assert.match(result.content[0].text, /partial output was discarded/);
 	const leader = state(await invoke(ask, { agent: "Farol", prompt: "leader-exits", client_request_id: "timeout-leader" }));
@@ -986,11 +988,31 @@ test("cancellation empties the process group, is idempotent, and leaves complete
 	assert.deepEqual(replay, first);
 	assert.equal(await eventCount(events, "ask:"), 1);
 	const cancelledResult = await invoke(request, { action: "result", request_id: running.request_id });
+	assert.equal(cancelledResult.details.outputKind, "discarded");
 	assert.doesNotMatch(cancelledResult.content[0].text, /github_pat_|PARTIAL_SECRET/);
 	const completed = state(await invoke(ask, { agent: "Farol", prompt: "reply", client_request_id: "completed-cancel" }));
 	const completedState = await waitForTerminal(request, completed.request_id);
 	const afterCancel = state(await invoke(request, { action: "cancel", request_id: completed.request_id }));
 	assert.deepEqual(afterCancel, completedState);
+});
+
+test("an already-aborted cancellation does not change or signal the request", async (t) => {
+	const { env, tools } = await fixture(t, { asyncAskTimeoutMs: 60_000, asyncKillGraceMs: 75 });
+	const ask = tools.get("maestri_ask_async")!;
+	const request = tools.get("maestri_ask_request")!;
+	const running = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "abort-before-cancel" }));
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		invoke(request, { action: "cancel", request_id: running.request_id }, controller.signal),
+		/abort/i,
+	);
+	const persisted = JSON.parse(await readFile(path.join(askStateRoot(env), `${running.request_id}.json`), "utf8"));
+	assert.equal(persisted.phase, "running");
+	assert.equal(persisted.custody, "held");
+	assert.doesNotThrow(() => process.kill(-persisted.runner.pgid, 0));
+	const cleaned = state(await invoke(request, { action: "cancel", request_id: running.request_id }));
+	assert.equal(cleaned.reply, "cancelled");
 });
 
 test("never signals a runner whose exact process identity no longer matches", async (t) => {
