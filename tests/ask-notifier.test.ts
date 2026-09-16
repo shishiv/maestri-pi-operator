@@ -5,9 +5,15 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerMaestriAsyncTools } from "../src/ask-async.ts";
-import { registerAskNotifier } from "../src/ask-notifier.ts";
+import {
+	registerAskNotifier,
+	type AskNotifierMessage,
+	type AskNotifierPi,
+	type NotifierContext,
+	type NotifierEventName,
+	type NotifierHandler,
+} from "../src/ask-notifier.ts";
 import {
 	atomicWriteRecord,
 	clientDigest,
@@ -21,29 +27,32 @@ import {
 	type ProcessIdentity,
 } from "../src/ask-store.ts";
 import { waitForTerminalRequest } from "../src/ask-waiter.ts";
+import { createPiToolHarness } from "./support/pi-tools.ts";
 
-type Handler = (event: unknown, ctx: { isIdle(): boolean }) => unknown;
+interface TestOwner {
+	pid: number;
+	identity: ProcessIdentity;
+}
 
-function fakePi(sendFails: boolean | (() => boolean) = false, onSend: () => void = () => {}) {
-	const handlers = new Map<string, Handler[]>();
-	const messages: Array<{ message: unknown; options: unknown }> = [];
-	const pi = {
-		on(name: string, handler: Handler) {
+function fakePi(sendFails: () => boolean = () => false, onSend: () => void = () => {}) {
+	const handlers = new Map<NotifierEventName, NotifierHandler[]>();
+	const messages: Array<{ message: AskNotifierMessage; options: { deliverAs: "followUp"; triggerTurn: true } }> = [];
+	const pi: AskNotifierPi = {
+		on(name, handler) {
 			const entries = handlers.get(name) ?? [];
 			entries.push(handler);
 			handlers.set(name, entries);
 		},
-		registerTool() {},
-		sendMessage(message: unknown, options: unknown) {
-			if (typeof sendFails === "function" ? sendFails() : sendFails) throw new Error("send failed");
+		sendMessage(message, options) {
+			if (sendFails()) throw new Error("send failed");
 			messages.push({ message, options });
 			onSend();
 		},
-	} as unknown as ExtensionAPI;
+	};
 	return {
 		pi,
 		messages,
-		async emit(name: string, ctx: { isIdle(): boolean }) {
+		async emit(name: NotifierEventName, ctx: NotifierContext) {
 			for (const handler of handlers.get(name) ?? []) await handler({}, ctx);
 		},
 	};
@@ -101,7 +110,7 @@ async function terminal(root: string, reply: "received" | "cancelled" = "receive
 	return completed;
 }
 
-function owner(pid: number): { pid: number; identity: ProcessIdentity } {
+function owner(pid: number): TestOwner {
 	return { pid, identity: { start_time: String(pid), cmdline_hex: Buffer.from(`owner-${pid}`).toString("hex") } };
 }
 
@@ -126,9 +135,8 @@ test("one idle wake becomes sent and busy delivery waits for agent_end", async (
 	await idle.emit("session_start", { isIdle: () => true });
 	assert.equal(idle.messages.length, 1);
 	assert.deepEqual(idle.messages[0].options, { deliverAs: "followUp", triggerTurn: true });
-	assert.equal((idle.messages[0].message as { customType: string }).customType, "mpo.ask-terminal");
+	assert.equal(idle.messages[0].message.customType, "mpo.ask-terminal");
 	const message = idle.messages[0].message;
-	assert.ok(message && typeof message === "object" && "content" in message && typeof message.content === "string");
 	assert.deepEqual(JSON.parse(message.content), {
 		schema: "mpo.ask-terminal-followup.v1",
 		request_id: first.request_id,
@@ -232,7 +240,7 @@ test("an idle wake overlapping a scan is retained without continuous polling", {
 	const release = latch();
 	const delivered = latch();
 	let sends = 0;
-	const fake = fakePi(false, () => { if (++sends === 2) delivered.resolve(); });
+	const fake = fakePi(() => false, () => { if (++sends === 2) delivered.resolve(); });
 	const ctx = { isIdle: () => true };
 	registerAskNotifier(fake.pi, {
 		...notifierOptions(env, owner(172), () => {}),
@@ -256,10 +264,13 @@ test("an idle wake overlapping a scan is retained without continuous polling", {
 test("restart reannounces sent-unacked once and acked result suppresses later sessions", async (t) => {
 	const { env, root } = await fixture(t);
 	const completed = await terminal(root);
+	const beforeNotice = await waitForTerminalRequest(env, completed.request_id, 20, 5);
+	assert.ok(beforeNotice);
 	const first = fakePi();
 	registerAskNotifier(first.pi, notifierOptions(env, owner(201), () => {}));
 	await first.emit("session_start", { isIdle: () => true });
 	assert.equal(first.messages.length, 1);
+	assert.deepEqual(await waitForTerminalRequest(env, completed.request_id, 20, 5), beforeNotice);
 
 	const restarted = fakePi();
 	registerAskNotifier(restarted.pi, notifierOptions(env, owner(202), () => {}));
@@ -267,10 +278,11 @@ test("restart reannounces sent-unacked once and acked result suppresses later se
 	await restarted.emit("agent_end", { isIdle: () => true });
 	assert.equal(restarted.messages.length, 1);
 
-	const tools = new Map<string, { execute: Function }>();
-	registerMaestriAsyncTools({ registerTool(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); } } as never, { env, platform: "linux" });
-	await tools.get("maestri_ask_request")!.execute("call", { action: "result", request_id: completed.request_id }, undefined, undefined, { cwd: "/tmp" });
+	const harness = createPiToolHarness("/tmp");
+	registerMaestriAsyncTools(harness.registrar, { env, platform: "linux" });
+	await harness.invoke("maestri_ask_request", { action: "result", request_id: completed.request_id });
 	assert.equal((await readRequest(root, completed.request_id)).notification.state, "acked");
+	assert.deepEqual(await waitForTerminalRequest(env, completed.request_id, 20, 5), beforeNotice);
 	const afterAck = fakePi();
 	registerAskNotifier(afterAck.pi, notifierOptions(env, owner(203), () => {}));
 	await afterAck.emit("session_start", { isIdle: () => true });
@@ -335,7 +347,7 @@ test("background journal failures are reported without an unhandled rejection an
 test("send failure stays pending and finite waiter never mutates notification state", async (t) => {
 	const { env, root } = await fixture(t);
 	const completed = await terminal(root, "cancelled");
-	const failing = fakePi(true);
+	const failing = fakePi(() => true);
 	registerAskNotifier(failing.pi, notifierOptions(env, owner(401), () => {}));
 	await failing.emit("session_start", { isIdle: () => true });
 	const pending = await readRequest(root, completed.request_id);
@@ -345,7 +357,17 @@ test("send failure stays pending and finite waiter never mutates notification st
 	const envelope = await waitForTerminalRequest(env, completed.request_id, 10, 2);
 	assert.ok(envelope);
 	assert.equal(JSON.stringify((await readRequest(root, completed.request_id)).notification), before);
+	const restarted = fakePi();
+	registerAskNotifier(restarted.pi, notifierOptions(env, owner(402), () => {}));
+	await restarted.emit("session_start", { isIdle: () => true });
+	assert.equal(restarted.messages.length, 1, "a later session retries the failed notification, never the prompt");
+	const retried = await readRequest(root, completed.request_id);
+	assert.equal(retried.notification.state, "sent");
+	assert.equal(retried.notification.attempts, 2);
+	assert.equal(restarted.messages[0].message.content.includes(completed.request_id), true);
+	assert.equal(restarted.messages[0].message.content.includes("prompt_digest"), false);
 });
+
 
 test("a synchronous send failure releases its claim and retries on the next idle event", async (t) => {
 	const { env, root } = await fixture(t);
@@ -382,7 +404,7 @@ test("a post-send journal failure does not reannounce after restart", async (t) 
 	const { env, root } = await fixture(t);
 	const completed = await terminal(root);
 	const unavailable = `${root}-unavailable`;
-	const first = fakePi(false, () => {
+	const first = fakePi(() => false, () => {
 		renameSync(root, unavailable);
 		writeFileSync(root, "unavailable");
 	});
@@ -391,7 +413,7 @@ test("a post-send journal failure does not reannounce after restart", async (t) 
 	t.after(() => first.emit("session_shutdown", ctx));
 
 	await first.emit("session_start", ctx);
-	rmSync(root);
+	rmSync(root, { recursive: true, force: true });
 	renameSync(unavailable, root);
 	assert.equal(first.messages.length, 1);
 	assert.equal((await readRequest(root, completed.request_id)).notification.state, "dispatching");

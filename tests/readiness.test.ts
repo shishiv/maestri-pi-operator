@@ -69,16 +69,16 @@ test("does not broaden the model allowlist beyond the captured Opus identity", (
 });
 
 test("preflight keeps the legacy refusal text and exposes sanitized structured diagnostics", () => {
-	assert.throws(() => assertReadyPiScreen("⠴ Working\nclaude-opus-5 • high"), (error: unknown) => {
-		assert.ok(error instanceof PreflightError);
-		assert.equal(error.message, "The target Pi is busy; no async request was launched");
-		assert.deepEqual(error.preflight, { stage: "readiness", reason: "busy", request_created: false });
+	assert.throws(() => assertReadyPiScreen("⠴ Working\nclaude-opus-5 • high"), (cause: unknown) => {
+		assert.ok(cause instanceof PreflightError);
+		assert.equal(cause.message, "The target Pi is busy; no async request was launched");
+		assert.deepEqual(cause.preflight, { stage: "readiness", reason: "busy", request_created: false });
 		return true;
 	});
-	assert.throws(() => assertReadyPiScreen("claude-opus-5.1 • high"), (error: unknown) => {
-		assert.ok(error instanceof PreflightError);
-		assert.equal(error.message, "The target is missing, ambiguous, or not a ready Pi; no async request was launched");
-		assert.deepEqual(error.preflight, { stage: "readiness", reason: "unknown-surface", request_created: false });
+	assert.throws(() => assertReadyPiScreen("claude-opus-5.1 • high"), (cause: unknown) => {
+		assert.ok(cause instanceof PreflightError);
+		assert.equal(cause.message, "The target is missing, ambiguous, or not a ready Pi; no async request was launched");
+		assert.deepEqual(cause.preflight, { stage: "readiness", reason: "unknown-surface", request_created: false });
 		return true;
 	});
 });

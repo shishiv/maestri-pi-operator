@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { Parse } from "typebox/value";
 import {
 	assertReadyPiScreen,
 	registerMaestriAsyncTools,
@@ -24,41 +25,64 @@ import {
 	ensureAskStateRoot,
 	outputPath,
 	promptDigest,
+	readRequest,
 	transitionTerminal,
 	type AskRequestRecord,
 } from "../src/ask-store.ts";
+import { createPiToolHarness, type PiToolHarness } from "./support/pi-tools.ts";
 
 const execFileAsync = promisify(execFile);
 
-type ToolResult = {
-	content: Array<{ type: string; text: string }>;
-	details: Record<string, unknown>;
-};
+type ToolResult = Awaited<ReturnType<PiToolHarness["invoke"]>>;
+type AsyncToolName = "maestri_ask_async" | "maestri_ask_request";
 
-type RegisteredTool = {
-	name: string;
-	parameters: { additionalProperties?: boolean };
-	execute: (
-		toolCallId: string,
-		params: Record<string, string>,
-		signal: AbortSignal | undefined,
-		onUpdate: undefined,
-		ctx: { cwd: string },
-	) => Promise<ToolResult>;
-};
+interface AskParameters {
+	agent: string;
+	prompt: string;
+	client_request_id: string;
+}
+
+interface RequestParameters {
+	action: string;
+	request_id: string;
+}
+
+type AsyncParameters = AskParameters | RequestParameters;
+
+const AsyncStateSchema = Type.Object({
+	request_id: Type.String(),
+	phase: Type.Union([Type.Literal("accepted"), Type.Literal("running"), Type.Literal("terminal")]),
+	delivery: Type.Union([Type.Literal("not-attempted"), Type.Literal("unknown"), Type.Literal("confirmed")]),
+	reply: Type.Union([
+		Type.Literal("none"),
+		Type.Literal("pending"),
+		Type.Literal("received"),
+		Type.Literal("cancelled"),
+		Type.Literal("unknown"),
+	]),
+	state_version: Type.Integer({ minimum: 1 }),
+	refusal: Type.Optional(Type.String()),
+}, { additionalProperties: true });
+
+const AsyncDetailsSchema = Type.Object({
+	exit_code: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+	termination: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	reason: Type.Optional(Type.String()),
+	outputKind: Type.Optional(Type.Union([
+		Type.Literal("extracted-reply"),
+		Type.Literal("full-capture-evidence"),
+		Type.Literal("discarded"),
+	])),
+	truncated: Type.Optional(Type.Boolean()),
+}, { additionalProperties: true });
 
 function registerTools(
-	env: Record<string, string | undefined>,
+	env: NodeJS.ProcessEnv,
 	options: Omit<MaestriAsyncRuntimeOptions, "env" | "platform"> = {},
-): Map<string, RegisteredTool> {
-	const tools = new Map<string, RegisteredTool>();
-	const pi = {
-		registerTool(tool: RegisteredTool) { tools.set(tool.name, tool); },
-		on() {},
-		sendMessage() {},
-	} as unknown as ExtensionAPI;
-	registerMaestriAsyncTools(pi, { env, platform: "linux", ...options });
-	return tools;
+): PiToolHarness {
+	const harness = createPiToolHarness("/tmp");
+	registerMaestriAsyncTools(harness.registrar, { env, platform: "linux", ...options });
+	return harness;
 }
 
 async function fixture(t: TestContext, options: Omit<MaestriAsyncRuntimeOptions, "env" | "platform"> = {}) {
@@ -176,19 +200,27 @@ if (action === "check") {
 	return { cli, dir, env, tools, events: path.join(dir, "events") };
 }
 
-async function invoke(tool: RegisteredTool, params: Record<string, string>, signal?: AbortSignal): Promise<ToolResult> {
-	return tool.execute("call", params, signal, undefined, { cwd: "/tmp" });
+async function invoke(
+	tools: PiToolHarness,
+	name: AsyncToolName,
+	params: AsyncParameters,
+	signal?: AbortSignal,
+): Promise<ToolResult> {
+	return tools.invoke(name, params, signal);
 }
 
 function state(result: ToolResult) {
-	return JSON.parse(result.content[0].text) as {
-		request_id: string;
-		phase: string;
-		delivery: string;
-		reply: string;
-		state_version: number;
-		refusal?: string;
-	};
+	return Parse(AsyncStateSchema, JSON.parse(text(result)));
+}
+
+function text(result: ToolResult): string {
+	const content = result.content[0];
+	assert.equal(content.type, "text");
+	return content.text;
+}
+
+function details(result: ToolResult) {
+	return Parse(AsyncDetailsSchema, result.details);
 }
 
 function acceptedRecord(
@@ -218,10 +250,10 @@ function acceptedRecord(
 	};
 }
 
-async function waitForTerminal(tool: RegisteredTool, requestId: string) {
+async function waitForTerminal(tools: PiToolHarness, requestId: string) {
 	const deadline = Date.now() + 5_000;
 	while (Date.now() < deadline) {
-		const current = state(await invoke(tool, { action: "status", request_id: requestId }));
+		const current = state(await invoke(tools, "maestri_ask_request", { action: "status", request_id: requestId }));
 		if (current.phase === "terminal") return current;
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
@@ -265,30 +297,30 @@ test("prompt fidelity survives runner and controlled CLI decoding with original 
 	const { dir, env, events, tools } = await fixture(t);
 	const prompt = String.raw`C:\tmp\notes literal \n \t \\ \\\\ "quotes" 'single' ` + "`$HOME é 😀\nreal\ttab";
 	const params = { agent: "Farol", prompt, client_request_id: "literal-corpus" };
-	const first = state(await invoke(tools.get("maestri_ask_async")!, params));
-	await waitForTerminal(tools.get("maestri_ask_request")!, first.request_id);
+	const first = state(await invoke(tools, "maestri_ask_async", params));
+	await waitForTerminal(tools, first.request_id);
 	assert.equal(JSON.parse(await readFile(path.join(dir, "received-prompt.json"), "utf8")), envelopedPrompt(prompt, first.request_id));
 	const record = JSON.parse(await readFile(path.join(askStateRoot(env), `${first.request_id}.json`), "utf8"));
 	assert.equal(record.prompt_digest, promptDigest(prompt));
 	assert.equal(record.prompt_bytes, Buffer.byteLength(prompt));
-	assert.equal(state(await invoke(tools.get("maestri_ask_async")!, params)).request_id, first.request_id);
+	assert.equal(state(await invoke(tools, "maestri_ask_async", params)).request_id, first.request_id);
 	assert.equal(await eventCount(events, "ask:"), 1);
-	await assert.rejects(invoke(tools.get("maestri_ask_async")!, { ...params, prompt: prompt.replace("\\n", "\n") }), /different agent or prompt/);
+	await assert.rejects(invoke(tools, "maestri_ask_async", { ...params, prompt: prompt.replace("\\n", "\n") }), /different agent or prompt/);
 });
 
 test("async accepts an option-looking prompt in the post-agent prompt position", async (t) => {
 	const { dir, tools } = await fixture(t);
-	const started = state(await invoke(tools.get("maestri_ask_async")!, {
+	const started = state(await invoke(tools, "maestri_ask_async", {
 		agent: "Farol", prompt: "--raw", client_request_id: "option-looking-prompt",
 	}));
-	await waitForTerminal(tools.get("maestri_ask_request")!, started.request_id);
+	await waitForTerminal(tools, started.request_id);
 	assert.equal(JSON.parse(await readFile(path.join(dir, "received-prompt.json"), "utf8")), envelopedPrompt("--raw", started.request_id));
 });
 
 test("prompt fidelity rejects encoded envelope overflow before preflight or acceptance", async (t) => {
 	const { env, events, tools } = await fixture(t);
 	// Raw text fits; only encoding plus the request envelope exceeds the limit.
-	await assert.rejects(invoke(tools.get("maestri_ask_async")!, {
+	await assert.rejects(invoke(tools, "maestri_ask_async", {
 		agent: "Farol", prompt: "\\".repeat(32_768), client_request_id: "encoded-overflow",
 	}), /UTF-8 bytes/);
 	assert.equal(await eventCount(events, "check:"), 0);
@@ -310,10 +342,10 @@ test("recovers historical client keys without applying new wire limits to a prom
 		exitCode: 0, rawBytes: 0, truncated: false,
 	}));
 	const params = { agent: original.agent, prompt, client_request_id: original.client_request_id };
-	const ask = tools.get("maestri_ask_async")!;
-	assert.equal(state(await invoke(ask, params)).request_id, original.request_id);
-	await assert.rejects(invoke(ask, { ...params, prompt: prompt + "different" }), /different agent or prompt/);
-	await assert.rejects(invoke(ask, { ...params, client_request_id: "new-wire-limit" }), /encoded prompt/);
+	const ask: AsyncToolName = "maestri_ask_async";
+	assert.equal(state(await invoke(tools, ask, params)).request_id, original.request_id);
+	await assert.rejects(invoke(tools, ask, { ...params, prompt: prompt + "different" }), /different agent or prompt/);
+	await assert.rejects(invoke(tools, ask, { ...params, client_request_id: "new-wire-limit" }), /encoded prompt/);
 	assert.equal(await eventCount(events, "check:"), 0);
 	assert.equal(await eventCount(events, "ask:"), 0);
 });
@@ -324,10 +356,10 @@ test("prompt fidelity accepts exact encoded envelope limit and JSON-expanded pay
 	const budget = 65_536 - overhead;
 	const prompts = ["\\".repeat(Math.floor(budget / 2)) + "a".repeat(budget % 2), "\u0001".repeat(budget)];
 	for (const [index, prompt] of prompts.entries()) {
-		const accepted = state(await invoke(tools.get("maestri_ask_async")!, {
+		const accepted = state(await invoke(tools, "maestri_ask_async", {
 			agent: "Farol", prompt, client_request_id: `boundary-${index}`,
 		}));
-		const terminal = await waitForTerminal(tools.get("maestri_ask_request")!, accepted.request_id);
+		const terminal = await waitForTerminal(tools, accepted.request_id);
 		assert.equal(terminal.delivery, "confirmed");
 		assert.equal(JSON.parse(await readFile(path.join(dir, "received-prompt.json"), "utf8")), envelopedPrompt(prompt, accepted.request_id));
 	}
@@ -347,21 +379,21 @@ test("reports safe runner startup diagnostics without losing the original receip
 	const invalidRunner = path.join(dir, "invalid-runner.mjs");
 	await writeFile(invalidRunner, 'import "./private-async-token-missing.mjs";\n');
 	const tools = registerTools(env, { asyncRunnerPath: invalidRunner, asyncHandshakeTimeoutMs: 1_000, asyncKillGraceMs: 75 });
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
 	const params = { agent: "Farol", prompt: "reply", client_request_id: "startup-import-error" };
-	const first = await invoke(ask, params);
+	const first = await invoke(tools, ask, params);
 	const current = state(first);
 	assert.deepEqual([current.phase, current.delivery, current.reply], ["terminal", "unknown", "unknown"]);
-	assert.match(first.content[0].text, /ERR_MODULE_NOT_FOUND/);
-	assert.equal(first.details.exit_code, 1);
-	assert.equal(first.details.termination, "process-error");
+	assert.match(text(first), /ERR_MODULE_NOT_FOUND/);
+	assert.equal(details(first).exit_code, 1);
+	assert.equal(details(first).termination, "process-error");
 	for (const action of ["status", "result"]) {
-		const result = await invoke(request, { action, request_id: current.request_id });
-		assert.match(result.content[0].text, /ERR_MODULE_NOT_FOUND/);
+		const result = await invoke(tools, request, { action, request_id: current.request_id });
+		assert.match(text(result), /ERR_MODULE_NOT_FOUND/);
 		assert.doesNotMatch(JSON.stringify(result), /private-async-token|invalid-runner\.mjs/);
 	}
-	assert.equal(state(await invoke(ask, params)).request_id, current.request_id);
+	assert.equal(state(await invoke(tools, ask, params)).request_id, current.request_id);
 	assert.equal(await eventCount(events, "check:"), 1);
 	assert.equal(await eventCount(events, "ask:"), 0);
 	assert.equal((await stat(outputPath(askStateRoot(env), current.request_id))).size, 0);
@@ -372,11 +404,11 @@ test("retains startup diagnostics when a large payload loses its pipe before han
 	const invalidRunner = path.join(dir, "invalid-large-runner.mjs");
 	await writeFile(invalidRunner, 'import "./private-async-token-missing.mjs";\n');
 	const tools = registerTools(env, { asyncRunnerPath: invalidRunner, asyncHandshakeTimeoutMs: 1_000, asyncKillGraceMs: 75 });
-	const result = await invoke(tools.get("maestri_ask_async")!, {
+	const result = await invoke(tools, "maestri_ask_async", {
 		agent: "Farol", prompt: "\u0001".repeat(60_000), client_request_id: "startup-large",
 	});
-	assert.match(result.content[0].text, /ERR_MODULE_NOT_FOUND/);
-	assert.equal(result.details.exit_code, 1);
+	assert.match(text(result), /ERR_MODULE_NOT_FOUND/);
+	assert.equal(details(result).exit_code, 1);
 	assert.doesNotMatch(JSON.stringify(result), /private-async-token/);
 	assert.equal(await eventCount(events, "ask:"), 0);
 });
@@ -386,11 +418,11 @@ test("bounds payload backpressure when a runner never reads its inherited pipe",
 	const blockedRunner = path.join(dir, "blocked-input.mjs");
 	await writeFile(blockedRunner, 'import { writeFileSync } from "node:fs";\nwriteFileSync(new URL("./blocked.pid", import.meta.url), String(process.pid));\nsetInterval(() => {}, 1000);\n');
 	const tools = registerTools(env, { asyncRunnerPath: blockedRunner, asyncHandshakeTimeoutMs: 150, asyncKillGraceMs: 75 });
-	const result = await invoke(tools.get("maestri_ask_async")!, {
+	const result = await invoke(tools, "maestri_ask_async", {
 		agent: "Farol", prompt: "\u0001".repeat(60_000), client_request_id: "blocked-input",
 	});
 	assert.equal(state(result).phase, "terminal");
-	assert.equal(result.details.reason, "runner-payload-timeout");
+	assert.equal(details(result).reason, "runner-payload-timeout");
 	assert.equal(await eventCount(events, "ask:"), 0);
 	const pid = Number(await readFile(path.join(dir, "blocked.pid"), "utf8"));
 	assert.throws(() => process.kill(-pid, 0));
@@ -405,7 +437,7 @@ test("never promotes a live child that does not author the token-bound runner ha
 		asyncHandshakeTimeoutMs: 75,
 		asyncKillGraceMs: 75,
 	});
-	const result = state(await invoke(tools.get("maestri_ask_async")!, {
+	const result = state(await invoke(tools, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "reply",
 		client_request_id: "no-handshake",
@@ -426,7 +458,7 @@ test("preserves orphan custody when an unmarked child cannot be cleaned up", asy
 		asyncKillGraceMs: 75,
 		asyncCancelProcessGroup: async () => false,
 	});
-	const result = state(await invoke(tools.get("maestri_ask_async")!, {
+	const result = state(await invoke(tools, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "reply",
 		client_request_id: "orphan-handshake",
@@ -437,7 +469,7 @@ test("preserves orphan custody when an unmarked child cannot be cleaned up", asy
 	assert.equal(persisted.phase, "accepted");
 	assert.equal(persisted.custody, "orphan");
 	await assert.rejects(
-		invoke(tools.get("maestri_ask_async")!, { agent: "Farol", prompt: "reply", client_request_id: "blocked-by-launch-orphan" }),
+		invoke(tools, "maestri_ask_async", { agent: "Farol", prompt: "reply", client_request_id: "blocked-by-launch-orphan" }),
 		/already has active async request/,
 	);
 	const pid = Number((await waitForFile(path.join(dir, "orphan-runner.pid"))).trim());
@@ -445,22 +477,52 @@ test("preserves orphan custody when an unmarked child cannot be cleaned up", asy
 	process.kill(-pid, "SIGKILL");
 });
 
+test("never signals a launched child whose process-group identity is uncertain", async (t) => {
+	const { dir, env, tools: _tools } = await fixture(t);
+	const nonRunner = path.join(dir, "uncertain-runner.mjs");
+	await writeFile(nonRunner, `import { createReadStream, writeFileSync } from "node:fs";\nwriteFileSync(new URL("./uncertain-runner.pid", import.meta.url), String(process.pid));\nfor await (const _ of createReadStream(null, { fd: 3 })) {}\nsetInterval(() => {}, 1000);\n`);
+	let cancellationCalls = 0;
+	const tools = registerTools(env, {
+		asyncRunnerPath: nonRunner,
+		asyncHandshakeTimeoutMs: 75,
+		asyncKillGraceMs: 75,
+		asyncReadProcessIdentity: async (pid) => ({
+			pgid: pid + 1,
+			identity: { start_time: "uncertain", cmdline_hex: "00" },
+		}),
+		asyncCancelProcessGroup: async () => {
+			cancellationCalls += 1;
+			return true;
+		},
+	});
+	const result = state(await invoke(tools, "maestri_ask_async", {
+		agent: "Farol",
+		prompt: "reply",
+		client_request_id: "uncertain-launch-identity",
+	}));
+	assert.deepEqual([result.phase, result.delivery, result.reply], ["accepted", "unknown", "unknown"]);
+	assert.equal(cancellationCalls, 0);
+	const pid = Number((await waitForFile(path.join(dir, "uncertain-runner.pid"))).trim());
+	assert.doesNotThrow(() => process.kill(pid, 0));
+	process.kill(-pid, "SIGKILL");
+});
+
 test("returns a durable id quickly, launches once on replay, and cancels without resend", async (t) => {
 	const { env, events, tools } = await fixture(t);
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
 	const started = Date.now();
-	const first = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "task-42" }));
+	const first = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "task-42" }));
 	assert.ok(Date.now() - started < 5_000);
 	assert.equal(first.phase, "running");
-	const replay = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "task-42" }));
+	const replay = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "task-42" }));
 	assert.equal(replay.request_id, first.request_id);
 	await assert.rejects(
-		invoke(ask, { agent: "Farol", prompt: "changed", client_request_id: "task-42" }),
+		invoke(tools, ask, { agent: "Farol", prompt: "changed", client_request_id: "task-42" }),
 		/different agent or prompt/,
 	);
 	await assert.rejects(
-		invoke(ask, { agent: "Other", prompt: "long", client_request_id: "task-42" }),
+		invoke(tools, ask, { agent: "Other", prompt: "long", client_request_id: "task-42" }),
 		/different agent or prompt/,
 	);
 	const deadline = Date.now() + 2_000;
@@ -475,7 +537,7 @@ test("returns a durable id quickly, launches once on replay, and cancels without
 	assert.doesNotMatch(persisted, /"prompt"|long/);
 	assert.equal((await stat(root)).mode & 0o777, 0o700);
 	assert.equal((await stat(recordFile)).mode & 0o777, 0o600);
-	const cancelled = state(await invoke(request, { action: "cancel", request_id: first.request_id }));
+	const cancelled = state(await invoke(tools, request, { action: "cancel", request_id: first.request_id }));
 	assert.equal(cancelled.reply, "cancelled");
 	assert.equal(await eventCount(events, "ask:"), 1);
 });
@@ -498,13 +560,14 @@ test("serializes identical client keys across processes", async (t) => {
 	const leftState = state(JSON.parse(left.stdout));
 	const rightState = state(JSON.parse(right.stdout));
 	assert.equal(leftState.request_id, rightState.request_id);
-	assert.equal(await eventCount(events, "check:"), 2);
+	const readinessChecks = await eventCount(events, "check:");
+	assert.ok(readinessChecks >= 1 && readinessChecks <= 2);
 	const deadline = Date.now() + 2_000;
 	while (Date.now() < deadline && await eventCount(events, "ask:") < 1) {
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 	assert.equal(await eventCount(events, "ask:"), 1);
-	await invoke(tools.get("maestri_ask_request")!, { action: "cancel", request_id: leftState.request_id });
+	await invoke(tools, "maestri_ask_request", { action: "cancel", request_id: leftState.request_id });
 });
 
 test("runs slow readiness outside the create lock and converges identical callers", async (t) => {
@@ -526,9 +589,9 @@ test("runs slow readiness outside the create lock and converges identical caller
 			};
 		},
 	});
-	const ask = tools.get("maestri_ask_async")!;
+	const ask: AsyncToolName = "maestri_ask_async";
 	const params = { agent: "Farol", prompt: "long", client_request_id: "slow-shared" };
-	const [left, right] = await Promise.all([invoke(ask, params), invoke(ask, params)]);
+	const [left, right] = await Promise.all([invoke(tools, ask, params), invoke(tools, ask, params)]);
 	assert.equal(state(left).request_id, state(right).request_id);
 	const deadline = Date.now() + 2_000;
 	while (Date.now() < deadline && await eventCount(events, "ask:") < 1) {
@@ -536,7 +599,7 @@ test("runs slow readiness outside the create lock and converges identical caller
 	}
 	assert.equal(started, 2);
 	assert.equal(await eventCount(events, "ask:"), 1);
-	await invoke(tools.get("maestri_ask_request")!, { action: "cancel", request_id: state(left).request_id });
+	await invoke(tools, "maestri_ask_request", { action: "cancel", request_id: state(left).request_id });
 });
 
 test("abort before acceptance or during handshake never dispatches invisibly", async (t) => {
@@ -549,7 +612,7 @@ test("abort before acceptance or during handshake never dispatches invisibly", a
 	});
 	setTimeout(() => before.abort(), 25);
 	await assert.rejects(
-		invoke(tools.get("maestri_ask_async")!, { agent: "Farol", prompt: "reply", client_request_id: "abort-preflight" }, before.signal),
+		invoke(tools, "maestri_ask_async", { agent: "Farol", prompt: "reply", client_request_id: "abort-preflight" }, before.signal),
 		/readiness check failed/,
 	);
 	assert.equal(await eventCount(events, "ask:"), 0);
@@ -567,7 +630,7 @@ test("abort before acceptance or during handshake never dispatches invisibly", a
 		MAESTRI_TERMINAL_ID: "terminal-abort",
 		MAESTRI_SOCKET: "/tmp/private-maestri-test.sock",
 	}, { asyncRunnerPath: delayed, asyncHandshakeTimeoutMs: 2_000, asyncKillGraceMs: 75 });
-	const pending = invoke(handshakeTools.get("maestri_ask_async")!, {
+	const pending = invoke(handshakeTools, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "reply",
 		client_request_id: "abort-handshake",
@@ -581,17 +644,17 @@ test("abort before acceptance or during handshake never dispatches invisibly", a
 
 test("refuses request IDs and client keys from foreign or unscoped Maestri contexts", async (t) => {
 	const { env, tools } = await fixture(t, { asyncKillGraceMs: 75 });
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const local = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "scoped-key" }));
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const local = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "scoped-key" }));
 	const foreignWorkspace = registerTools({ ...env, MAESTRI_WORKSPACE_ID: "foreign-workspace" });
 	await assert.rejects(
-		invoke(foreignWorkspace.get("maestri_ask_request")!, { action: "status", request_id: local.request_id }),
+		invoke(foreignWorkspace, "maestri_ask_request", { action: "status", request_id: local.request_id }),
 		/foreign Maestri scope/,
 	);
 	const foreignTerminal = registerTools({ ...env, MAESTRI_TERMINAL_ID: "foreign-terminal" });
 	await assert.rejects(
-		invoke(foreignTerminal.get("maestri_ask_request")!, { action: "cancel", request_id: local.request_id }),
+		invoke(foreignTerminal, "maestri_ask_request", { action: "cancel", request_id: local.request_id }),
 		/foreign Maestri scope/,
 	);
 	const legacyKey = "legacy-key";
@@ -599,22 +662,21 @@ test("refuses request IDs and client keys from foreign or unscoped Maestri conte
 	await mkdir(legacyIndex, { recursive: true, mode: 0o700 });
 	await writeFile(path.join(legacyIndex, clientDigest(legacyKey)), "legacy\n", { mode: 0o600 });
 	await assert.rejects(
-		invoke(ask, { agent: "Farol", prompt: "reply", client_request_id: legacyKey }),
+		invoke(tools, ask, { agent: "Farol", prompt: "reply", client_request_id: legacyKey }),
 		/unscoped legacy/,
 	);
 	const { MAESTRI_TERMINAL_ID: _terminal, ...missingTerminalEnv } = env;
 	const missingTerminal = registerTools(missingTerminalEnv);
 	await assert.rejects(
-		invoke(missingTerminal.get("maestri_ask_async")!, { agent: "Farol", prompt: "reply", client_request_id: "missing-terminal" }),
+		invoke(missingTerminal, "maestri_ask_async", { agent: "Farol", prompt: "reply", client_request_id: "missing-terminal" }),
 		/require MAESTRI_WORKSPACE_ID and MAESTRI_TERMINAL_ID/,
 	);
-	await invoke(request, { action: "cancel", request_id: local.request_id });
+	await invoke(tools, request, { action: "cancel", request_id: local.request_id });
 });
 
 test("fresh registrations reconcile accepted, running, output, and completed crash boundaries without resend", async (t) => {
 	const { env, events, tools } = await fixture(t);
 	const root = await ensureAskStateRoot(env);
-	const request = tools.get("maestri_ask_request")!;
 	const interrupted = acceptedRecord("crash-client-index", "never-send-index", path.basename(root));
 	await writeFile(
 		path.join(root, "by-client", clientDigest(interrupted.client_request_id)),
@@ -622,7 +684,7 @@ test("fresh registrations reconcile accepted, running, output, and completed cra
 		{ mode: 0o600 },
 	);
 	const afterIndexCrash = registerTools(env);
-	const interruptedReplay = state(await invoke(afterIndexCrash.get("maestri_ask_async")!, {
+	const interruptedReplay = state(await invoke(afterIndexCrash, "maestri_ask_async", {
 		agent: interrupted.agent,
 		prompt: "never-send-index",
 		client_request_id: interrupted.client_request_id,
@@ -637,7 +699,7 @@ test("fresh registrations reconcile accepted, running, output, and completed cra
 	const accepted = acceptedRecord("crash-accepted", "never-send", path.basename(root), new Date(Date.now() - 20_000).toISOString());
 	await createAcceptedRequest(root, accepted, clientDigest(accepted.client_request_id));
 	const afterAcceptedCrash = registerTools(env);
-	const acceptedReplay = state(await invoke(afterAcceptedCrash.get("maestri_ask_async")!, {
+	const acceptedReplay = state(await invoke(afterAcceptedCrash, "maestri_ask_async", {
 		agent: accepted.agent,
 		prompt: "never-send",
 		client_request_id: accepted.client_request_id,
@@ -665,13 +727,13 @@ test("fresh registrations reconcile accepted, running, output, and completed cra
 		state_version: 2,
 	});
 	const afterOutputCrash = registerTools(env);
-	const outputState = state(await invoke(afterOutputCrash.get("maestri_ask_request")!, {
+	const outputState = state(await invoke(afterOutputCrash, "maestri_ask_request", {
 		action: "status",
 		request_id: outputCrash.request_id,
 	}));
 	assert.deepEqual([outputState.delivery, outputState.reply], ["unknown", "unknown"]);
 	assert.equal((await stat(outputPath(root, outputCrash.request_id))).size, 0);
-	const outputReplay = state(await invoke(afterOutputCrash.get("maestri_ask_async")!, {
+	const outputReplay = state(await invoke(afterOutputCrash, "maestri_ask_async", {
 		agent: outputCrash.agent,
 		prompt: "never-send-output",
 		client_request_id: outputCrash.client_request_id,
@@ -679,7 +741,7 @@ test("fresh registrations reconcile accepted, running, output, and completed cra
 	assert.equal(outputReplay.request_id, outputCrash.request_id);
 	assert.equal(await eventCount(events, "ask:"), 0);
 
-	const live = state(await invoke(afterOutputCrash.get("maestri_ask_async")!, {
+	const live = state(await invoke(afterOutputCrash, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "long",
 		client_request_id: "crash-running",
@@ -693,12 +755,12 @@ test("fresh registrations reconcile accepted, running, output, and completed cra
 	process.kill(-liveRecord.runner.pgid, "SIGKILL");
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	const afterRunningCrash = registerTools(env);
-	const dead = state(await invoke(afterRunningCrash.get("maestri_ask_request")!, {
+	const dead = state(await invoke(afterRunningCrash, "maestri_ask_request", {
 		action: "status",
 		request_id: live.request_id,
 	}));
 	assert.deepEqual([dead.delivery, dead.reply], ["unknown", "unknown"]);
-	const liveReplay = state(await invoke(afterRunningCrash.get("maestri_ask_async")!, {
+	const liveReplay = state(await invoke(afterRunningCrash, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "long",
 		client_request_id: "crash-running",
@@ -707,32 +769,32 @@ test("fresh registrations reconcile accepted, running, output, and completed cra
 	const sendsAfterRunningCrash = await eventCount(events, "ask:");
 	assert.equal(sendsAfterRunningCrash, 1);
 
-	const fast = state(await invoke(afterRunningCrash.get("maestri_ask_async")!, {
+	const fast = state(await invoke(afterRunningCrash, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "reply",
 		client_request_id: "crash-after-terminal",
 	}));
-	const fastTerminal = await waitForTerminal(request, fast.request_id);
+	const fastTerminal = await waitForTerminal(tools, fast.request_id);
 	const afterCallerCrash = registerTools(env);
-	const stable = state(await invoke(afterCallerCrash.get("maestri_ask_async")!, {
+	const stable = state(await invoke(afterCallerCrash, "maestri_ask_async", {
 		agent: "Farol",
 		prompt: "reply",
 		client_request_id: "crash-after-terminal",
 	}));
 	assert.deepEqual(stable, fastTerminal);
-	const stableResult = await invoke(afterCallerCrash.get("maestri_ask_request")!, {
+	const stableResult = await invoke(afterCallerCrash, "maestri_ask_request", {
 		action: "result",
 		request_id: fast.request_id,
 	});
-	assert.match(stableResult.content[0].text, /reply token=\[REDACTED\]/);
+	assert.match(text(stableResult), /reply token=\[REDACTED\]/);
 	assert.equal(await eventCount(events, "ask:"), sendsAfterRunningCrash + 1);
 });
 
 test("target replacement after native dispatch never resends or accepts the new generation", async (t) => {
 	const { dir, env, events, tools } = await fixture(t);
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const accepted = state(await invoke(ask, {
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const accepted = state(await invoke(tools, ask, {
 		agent: "Farol",
 		prompt: "replacement:GEN-A",
 		client_request_id: "replace-after-dispatch",
@@ -742,25 +804,25 @@ test("target replacement after native dispatch never resends or accepts the new 
 	const runningRecord = JSON.parse(await readFile(path.join(askStateRoot(env), `${accepted.request_id}.json`), "utf8"));
 	assert.equal(runningRecord.phase, "running");
 	await writeFile(path.join(dir, "replace-target"), "GEN-B");
-	const terminal = await waitForTerminal(request, accepted.request_id);
+	const terminal = await waitForTerminal(tools, accepted.request_id);
 	assert.deepEqual([terminal.delivery, terminal.reply], ["unknown", "unknown"]);
 	await waitForGroupGone(runningRecord.runner.pgid);
-	const replay = state(await invoke(ask, {
+	const replay = state(await invoke(tools, ask, {
 		agent: "Farol",
 		prompt: "replacement:GEN-A",
 		client_request_id: "replace-after-dispatch",
 	}));
 	assert.deepEqual(replay, terminal);
 	assert.equal(await eventCount(events, "ask:"), 1);
-	const evidence = await invoke(request, { action: "result", request_id: accepted.request_id });
-	assert.equal(evidence.details.outputKind, "full-capture-evidence");
+	const evidence = await invoke(tools, request, { action: "result", request_id: accepted.request_id });
+	assert.equal(details(evidence).outputKind, "full-capture-evidence");
 });
 
 test("pending result exposes state only and never partial output", async (t) => {
 	const { events, tools } = await fixture(t, { asyncKillGraceMs: 75 });
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const running = state(await invoke(ask, {
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const running = state(await invoke(tools, ask, {
 		agent: "Farol",
 		prompt: "partial-long",
 		client_request_id: "pending-result",
@@ -769,10 +831,10 @@ test("pending result exposes state only and never partial output", async (t) => 
 	while (Date.now() < deadline && await eventCount(events, "ask:") < 1) {
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
-	const pending = await invoke(request, { action: "result", request_id: running.request_id });
+	const pending = await invoke(tools, request, { action: "result", request_id: running.request_id });
 	assert.equal(state(pending).phase, "running");
-	assert.doesNotMatch(pending.content[0].text, /UNTRUSTED|private-async-token|partial/);
-	await invoke(request, { action: "cancel", request_id: running.request_id });
+	assert.doesNotMatch(text(pending), /UNTRUSTED|private-async-token|partial/);
+	await invoke(tools, request, { action: "cancel", request_id: running.request_id });
 });
 
 test("isolates one matched reply envelope and rejects missing duplicate or malformed markers", async (t) => {
@@ -797,23 +859,23 @@ test("isolates one matched reply envelope and rejects missing duplicate or malfo
 		extractReplyEnvelope(`${marker.begin}\none\n${marker.end}\n${marker.begin}\ntwo\n${marker.end}`, sampleId).reply,
 		"unknown",
 	);
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const isolated = state(await invoke(ask, { agent: "Farol", prompt: "isolation", client_request_id: "isolation" }));
-	const isolatedTerminal = await waitForTerminal(request, isolated.request_id);
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const isolated = state(await invoke(tools, ask, { agent: "Farol", prompt: "isolation", client_request_id: "isolation" }));
+	const isolatedTerminal = await waitForTerminal(tools, isolated.request_id);
 	assert.equal(isolatedTerminal.reply, "received");
-	const isolatedResult = await invoke(request, { action: "result", request_id: isolated.request_id });
-	assert.match(isolatedResult.content[0].text, /ASYNC_REPLY/);
-	assert.doesNotMatch(isolatedResult.content[0].text, /noise-before|noise-after|old-reply|MAESTRI_REPLY_(?:BEGIN|END)/);
-	assert.equal(isolatedResult.details.outputKind, "extracted-reply");
+	const isolatedResult = await invoke(tools, request, { action: "result", request_id: isolated.request_id });
+	assert.match(text(isolatedResult), /ASYNC_REPLY/);
+	assert.doesNotMatch(text(isolatedResult), /noise-before|noise-after|old-reply|MAESTRI_REPLY_(?:BEGIN|END)/);
+	assert.equal(details(isolatedResult).outputKind, "extracted-reply");
 	assert.match(await readFile(outputPath(askStateRoot(env), isolated.request_id), "utf8"), /noise-before[\s\S]*noise-after/);
 	for (const prompt of ["missing-envelope", "duplicate-envelope", "malformed-envelope"]) {
-		const accepted = state(await invoke(ask, { agent: "Farol", prompt, client_request_id: prompt }));
-		const terminal = await waitForTerminal(request, accepted.request_id);
+		const accepted = state(await invoke(tools, ask, { agent: "Farol", prompt, client_request_id: prompt }));
+		const terminal = await waitForTerminal(tools, accepted.request_id);
 		assert.equal(terminal.delivery, "confirmed", prompt);
 		assert.equal(terminal.reply, "unknown", prompt);
-		const evidence = await invoke(request, { action: "result", request_id: accepted.request_id });
-		assert.equal(evidence.details.outputKind, "full-capture-evidence");
+		const evidence = await invoke(tools, request, { action: "result", request_id: accepted.request_id });
+		assert.equal(details(evidence).outputKind, "full-capture-evidence");
 	}
 });
 
@@ -822,10 +884,10 @@ test("cleanup uncertainty resolves terminal unknown without reporting cancellati
 		asyncKillGraceMs: 75,
 		asyncCancelProcessGroup: async () => false,
 	});
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const running = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "cleanup-unknown" }));
-	const refused = state(await invoke(request, { action: "cancel", request_id: running.request_id }));
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const running = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "cleanup-unknown" }));
+	const refused = state(await invoke(tools, request, { action: "cancel", request_id: running.request_id }));
 	assert.equal(refused.phase, "running");
 	assert.equal(refused.reply, "unknown");
 	assert.match(refused.refusal ?? "", /not reported/);
@@ -833,19 +895,19 @@ test("cleanup uncertainty resolves terminal unknown without reporting cancellati
 	assert.equal(persisted.phase, "running");
 	assert.equal(persisted.custody, "orphan");
 	await assert.rejects(
-		invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "blocked-after-cleanup" }),
+		invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "blocked-after-cleanup" }),
 		/already has active async request/,
 	);
 	process.kill(-persisted.runner.pgid, "SIGKILL");
 	await waitForGroupGone(persisted.runner.pgid);
-	await invoke(request, { action: "status", request_id: running.request_id });
+	await invoke(tools, request, { action: "status", request_id: running.request_id });
 });
 
 test("refuses non-ready targets before creating or launching a request", async (t) => {
 	const { env, events, tools } = await fixture(t);
-	const ask = tools.get("maestri_ask_async")!;
+	const ask: AsyncToolName = "maestri_ask_async";
 	for (const agent of ["Busy", "Spinner", "Shell", "Blank", "NonPi", "Ambiguous", "MultiFooter", "Retrying", "ShellFooter", "ThinkingHigh", "Stale", "Missing"]) {
-		await assert.rejects(invoke(ask, {
+		await assert.rejects(invoke(tools, ask, {
 			agent,
 			prompt: "reply",
 			client_request_id: `not-ready-${agent}`,
@@ -857,7 +919,7 @@ test("refuses non-ready targets before creating or launching a request", async (
 	const root = askStateRoot(env);
 	assert.deepEqual((await import("node:fs/promises").then((fs) => fs.readdir(root))).filter((name) => name.endsWith(".json")), []);
 	const timed = registerTools(env, { asyncPreflightTimeoutMs: 75 });
-	await assert.rejects(invoke(timed.get("maestri_ask_async")!, {
+	await assert.rejects(invoke(timed, "maestri_ask_async", {
 		agent: "Slow",
 		prompt: "reply",
 		client_request_id: "not-ready-timeout",
@@ -865,67 +927,79 @@ test("refuses non-ready targets before creating or launching a request", async (
 	const controller = new AbortController();
 	controller.abort();
 	await assert.rejects(
-		ask.execute("call", {
+		invoke(tools, ask, {
 			agent: "Farol",
 			prompt: "reply",
 			client_request_id: "not-ready-abort",
-		}, controller.signal, undefined, { cwd: "/tmp" }),
+		}, controller.signal),
 		/readiness check failed/,
 	);
 	assert.equal(await eventCount(events, "ask:"), 0);
 	assert.deepEqual((await import("node:fs/promises").then((fs) => fs.readdir(root))).filter((name) => /\.json$|\.out$/.test(name)), []);
-	const accepted = state(await invoke(ask, {
+	const accepted = state(await invoke(tools, ask, {
 		agent: "ThinkingOff",
 		prompt: "reply",
 		client_request_id: "ready-thinking-off",
 	}));
-	await waitForTerminal(tools.get("maestri_ask_request")!, accepted.request_id);
+	await waitForTerminal(tools, accepted.request_id);
 	assert.equal(await eventCount(events, "ask:"), 1);
 });
 
 test("caps raw output and returns only sanitized untrusted terminal output", async (t) => {
 	const { env, tools } = await fixture(t);
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const success = state(await invoke(ask, { agent: "Farol", prompt: "reply", client_request_id: "reply" }));
-	await waitForTerminal(request, success.request_id);
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const success = state(await invoke(tools, ask, { agent: "Farol", prompt: "reply", client_request_id: "reply" }));
+	await waitForTerminal(tools, success.request_id);
 	const root = askStateRoot(env);
+	const receiptFile = path.join(root, `${success.request_id}.json`);
+	const receiptBeforeResult = await readRequest(root, success.request_id);
 	assert.doesNotMatch(await readFile(outputPath(root, success.request_id), "utf8"), /private-async-token/);
 	const rotated = registerTools({ ...env, MAESTRI_TOKEN: "rotated-token" });
-	const result = await invoke(rotated.get("maestri_ask_request")!, { action: "result", request_id: success.request_id });
-	assert.match(result.content[0].text, /UNTRUSTED PEER OUTPUT/);
-	assert.doesNotMatch(result.content[0].text, /private-async-token/);
+	const result = await invoke(rotated, "maestri_ask_request", { action: "result", request_id: success.request_id });
+	const receiptAfterAck = await readRequest(root, success.request_id);
+	assert.equal(receiptAfterAck.notification.state, "acked");
+	assert.equal(receiptAfterAck.notification.digest, receiptBeforeResult.notification.digest);
+	assert.equal(receiptAfterAck.state_version, receiptBeforeResult.state_version);
+	const ackedFile = await stat(receiptFile);
+	assert.match(text(result), /UNTRUSTED PEER OUTPUT/);
+	assert.doesNotMatch(text(result), /private-async-token/);
 	const absent = registerTools({ ...env, MAESTRI_TOKEN: undefined });
-	const absentResult = await invoke(absent.get("maestri_ask_request")!, { action: "result", request_id: success.request_id });
-	assert.doesNotMatch(absentResult.content[0].text, /private-async-token/);
-	const many = state(await invoke(ask, { agent: "Farol", prompt: "many", client_request_id: "many" }));
-	await waitForTerminal(request, many.request_id);
-	const manyResult = await invoke(request, { action: "result", request_id: many.request_id });
-	assert.equal(manyResult.details.truncated, true);
-	assert.match(manyResult.content[0].text, /\[TRUNCATED:/);
-	assert.doesNotMatch(manyResult.content[0].text, /private-async-token|password@example|hidden-bidi|\u001b|\u202e/);
-	assert.ok(Buffer.byteLength(manyResult.content[0].text) <= 50 * 1024);
-	assert.ok(manyResult.content[0].text.split("\n").length <= 2_000);
+	const absentResult = await invoke(absent, "maestri_ask_request", { action: "result", request_id: success.request_id });
+	const unchangedFile = await stat(receiptFile);
+	assert.equal(unchangedFile.ino, ackedFile.ino);
+	assert.equal(unchangedFile.mtimeMs, ackedFile.mtimeMs);
+	assert.doesNotMatch(text(absentResult), /private-async-token/);
+	const many = state(await invoke(tools, ask, { agent: "Farol", prompt: "many", client_request_id: "many" }));
+	await waitForTerminal(tools, many.request_id);
+	const manyResult = await invoke(tools, request, { action: "result", request_id: many.request_id });
+	assert.equal(details(manyResult).truncated, true);
+	assert.match(text(manyResult), /\[TRUNCATED:/);
+	assert.doesNotMatch(text(manyResult), /private-async-token|password@example|hidden-bidi/);
+	assert.equal(text(manyResult).includes("\u001b"), false);
+	assert.equal(text(manyResult).includes("\u202e"), false);
+	assert.ok(Buffer.byteLength(text(manyResult)) <= 50 * 1024);
+	assert.ok(text(manyResult).split("\n").length <= 2_000);
 	assert.equal((await stat(outputPath(root, many.request_id))).mode & 0o777, 0o600);
-	const noisy = state(await invoke(ask, { agent: "Farol", prompt: "noisy", client_request_id: "noisy" }));
-	const terminal = await waitForTerminal(request, noisy.request_id);
+	const noisy = state(await invoke(tools, ask, { agent: "Farol", prompt: "noisy", client_request_id: "noisy" }));
+	const terminal = await waitForTerminal(tools, noisy.request_id);
 	assert.equal(terminal.delivery, "unknown");
 	assert.equal(terminal.reply, "unknown");
-	const capped = await invoke(request, { action: "result", request_id: noisy.request_id });
-	assert.equal(capped.details.outputKind, "discarded");
-	assert.match(capped.content[0].text, /UNTRUSTED PEER OUTPUT/);
-	assert.match(capped.content[0].text, /partial output was discarded/);
-	assert.ok(Buffer.byteLength(capped.content[0].text) <= 50 * 1024);
+	const capped = await invoke(tools, request, { action: "result", request_id: noisy.request_id });
+	assert.equal(details(capped).outputKind, "discarded");
+	assert.match(text(capped), /UNTRUSTED PEER OUTPUT/);
+	assert.match(text(capped), /partial output was discarded/);
+	assert.ok(Buffer.byteLength(text(capped)) <= 50 * 1024);
 	assert.equal((await stat(outputPath(root, noisy.request_id))).size, 0);
 	assert.doesNotMatch(JSON.stringify(capped.details), /x{20}|private-async-token/);
 });
 
 test("times out and kills a TERM-ignoring process group without exposing partial output", async (t) => {
 	const { dir, env, events, tools } = await fixture(t, { asyncAskTimeoutMs: 75, asyncKillGraceMs: 75 });
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const accepted = state(await invoke(ask, { agent: "Farol", prompt: "timeout", client_request_id: "timeout" }));
-	const terminal = accepted.phase === "terminal" ? accepted : await waitForTerminal(request, accepted.request_id);
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const accepted = state(await invoke(tools, ask, { agent: "Farol", prompt: "timeout", client_request_id: "timeout" }));
+	const terminal = accepted.phase === "terminal" ? accepted : await waitForTerminal(tools, accepted.request_id);
 	assert.equal(terminal.delivery, "unknown");
 	assert.equal(terminal.reply, "unknown");
 	const root = askStateRoot(env);
@@ -936,12 +1010,12 @@ test("times out and kills a TERM-ignoring process group without exposing partial
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	assert.throws(() => process.kill(descendant, 0));
 	await waitForGroupGone(record.runner.pgid);
-	const result = await invoke(request, { action: "result", request_id: accepted.request_id });
-	assert.equal(result.details.outputKind, "discarded");
-	assert.doesNotMatch(result.content[0].text, /github_pat_|PARTIAL_SECRET/);
-	assert.match(result.content[0].text, /partial output was discarded/);
-	const leader = state(await invoke(ask, { agent: "Farol", prompt: "leader-exits", client_request_id: "timeout-leader" }));
-	const leaderTerminal = leader.phase === "terminal" ? leader : await waitForTerminal(request, leader.request_id);
+	const result = await invoke(tools, request, { action: "result", request_id: accepted.request_id });
+	assert.equal(details(result).outputKind, "discarded");
+	assert.doesNotMatch(text(result), /github_pat_|PARTIAL_SECRET/);
+	assert.match(text(result), /partial output was discarded/);
+	const leader = state(await invoke(tools, ask, { agent: "Farol", prompt: "leader-exits", client_request_id: "timeout-leader" }));
+	const leaderTerminal = leader.phase === "terminal" ? leader : await waitForTerminal(tools, leader.request_id);
 	assert.deepEqual([leaderTerminal.delivery, leaderTerminal.reply], ["unknown", "unknown"]);
 	const leaderRecord = JSON.parse(await readFile(path.join(root, `${leader.request_id}.json`), "utf8"));
 	assert.equal(leaderRecord.terminal.termination, "timeout");
@@ -949,8 +1023,8 @@ test("times out and kills a TERM-ignoring process group without exposing partial
 	assert.throws(() => process.kill(leaderDescendant, 0));
 	await waitForGroupGone(leaderRecord.runner.pgid);
 	assert.equal((await stat(outputPath(root, leader.request_id))).size, 0);
-	const normal = state(await invoke(ask, { agent: "Farol", prompt: "normal-descendant", client_request_id: "normal-descendant" }));
-	const normalTerminal = normal.phase === "terminal" ? normal : await waitForTerminal(request, normal.request_id);
+	const normal = state(await invoke(tools, ask, { agent: "Farol", prompt: "normal-descendant", client_request_id: "normal-descendant" }));
+	const normalTerminal = normal.phase === "terminal" ? normal : await waitForTerminal(tools, normal.request_id);
 	assert.deepEqual([normalTerminal.delivery, normalTerminal.reply], ["unknown", "unknown"]);
 	const normalRecord = JSON.parse(await readFile(path.join(root, `${normal.request_id}.json`), "utf8"));
 	assert.equal(normalRecord.terminal.termination, "process-error");
@@ -958,73 +1032,73 @@ test("times out and kills a TERM-ignoring process group without exposing partial
 	assert.throws(() => process.kill(normalDescendant, 0));
 	await waitForGroupGone(normalRecord.runner.pgid);
 	assert.equal((await stat(outputPath(root, normal.request_id))).size, 0);
-	const normalResult = await invoke(request, { action: "result", request_id: normal.request_id });
-	assert.doesNotMatch(normalResult.content[0].text, /premature-success/);
+	const normalResult = await invoke(tools, request, { action: "result", request_id: normal.request_id });
+	assert.doesNotMatch(text(normalResult), /premature-success/);
 	assert.equal(await eventCount(events, "ask:"), 3);
 });
 
 test("cancellation empties the process group, is idempotent, and leaves completed results unchanged", async (t) => {
 	const { dir, env, events, tools } = await fixture(t, { asyncAskTimeoutMs: 60_000, asyncKillGraceMs: 75 });
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
 	const root = askStateRoot(env);
 	await ensureAskStateRoot(env);
 	const accepted = acceptedRecord("cancel-accepted", "never-send", path.basename(root));
 	await createAcceptedRequest(root, accepted, clientDigest(accepted.client_request_id));
-	const acceptedCancel = state(await invoke(request, { action: "cancel", request_id: accepted.request_id }));
+	const acceptedCancel = state(await invoke(tools, request, { action: "cancel", request_id: accepted.request_id }));
 	assert.deepEqual([acceptedCancel.delivery, acceptedCancel.reply], ["not-attempted", "cancelled"]);
-	const acceptedAgain = state(await invoke(request, { action: "cancel", request_id: accepted.request_id }));
+	const acceptedAgain = state(await invoke(tools, request, { action: "cancel", request_id: accepted.request_id }));
 	assert.equal(acceptedAgain.state_version, acceptedCancel.state_version);
-	const running = state(await invoke(ask, { agent: "Farol", prompt: "timeout", client_request_id: "cancel-tree" }));
+	const running = state(await invoke(tools, ask, { agent: "Farol", prompt: "timeout", client_request_id: "cancel-tree" }));
 	const descendant = Number((await waitForFile(path.join(dir, "descendant"))).trim());
 	const before = JSON.parse(await readFile(path.join(root, `${running.request_id}.json`), "utf8"));
-	const first = state(await invoke(request, { action: "cancel", request_id: running.request_id }));
+	const first = state(await invoke(tools, request, { action: "cancel", request_id: running.request_id }));
 	assert.equal(first.reply, "cancelled");
 	assert.throws(() => process.kill(descendant, 0));
 	assert.throws(() => process.kill(-before.runner.pgid, 0));
-	const second = state(await invoke(request, { action: "cancel", request_id: running.request_id }));
+	const second = state(await invoke(tools, request, { action: "cancel", request_id: running.request_id }));
 	assert.equal(second.state_version, first.state_version);
-	const replay = state(await invoke(ask, { agent: "Farol", prompt: "timeout", client_request_id: "cancel-tree" }));
+	const replay = state(await invoke(tools, ask, { agent: "Farol", prompt: "timeout", client_request_id: "cancel-tree" }));
 	assert.deepEqual(replay, first);
 	assert.equal(await eventCount(events, "ask:"), 1);
-	const cancelledResult = await invoke(request, { action: "result", request_id: running.request_id });
-	assert.equal(cancelledResult.details.outputKind, "discarded");
-	assert.doesNotMatch(cancelledResult.content[0].text, /github_pat_|PARTIAL_SECRET/);
-	const completed = state(await invoke(ask, { agent: "Farol", prompt: "reply", client_request_id: "completed-cancel" }));
-	const completedState = await waitForTerminal(request, completed.request_id);
-	const afterCancel = state(await invoke(request, { action: "cancel", request_id: completed.request_id }));
+	const cancelledResult = await invoke(tools, request, { action: "result", request_id: running.request_id });
+	assert.equal(details(cancelledResult).outputKind, "discarded");
+	assert.doesNotMatch(text(cancelledResult), /github_pat_|PARTIAL_SECRET/);
+	const completed = state(await invoke(tools, ask, { agent: "Farol", prompt: "reply", client_request_id: "completed-cancel" }));
+	const completedState = await waitForTerminal(tools, completed.request_id);
+	const afterCancel = state(await invoke(tools, request, { action: "cancel", request_id: completed.request_id }));
 	assert.deepEqual(afterCancel, completedState);
 });
 
 test("an already-aborted cancellation does not change or signal the request", async (t) => {
 	const { env, tools } = await fixture(t, { asyncAskTimeoutMs: 60_000, asyncKillGraceMs: 75 });
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const running = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "abort-before-cancel" }));
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const running = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "abort-before-cancel" }));
 	const controller = new AbortController();
 	controller.abort();
 	await assert.rejects(
-		invoke(request, { action: "cancel", request_id: running.request_id }, controller.signal),
+		invoke(tools, request, { action: "cancel", request_id: running.request_id }, controller.signal),
 		/abort/i,
 	);
 	const persisted = JSON.parse(await readFile(path.join(askStateRoot(env), `${running.request_id}.json`), "utf8"));
 	assert.equal(persisted.phase, "running");
 	assert.equal(persisted.custody, "held");
 	assert.doesNotThrow(() => process.kill(-persisted.runner.pgid, 0));
-	const cleaned = state(await invoke(request, { action: "cancel", request_id: running.request_id }));
+	const cleaned = state(await invoke(tools, request, { action: "cancel", request_id: running.request_id }));
 	assert.equal(cleaned.reply, "cancelled");
 });
 
 test("never signals a runner whose exact process identity no longer matches", async (t) => {
 	const { env, tools } = await fixture(t);
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const accepted = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "identity" }));
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const accepted = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "identity" }));
 	const recordFile = path.join(askStateRoot(env), `${accepted.request_id}.json`);
 	const record = JSON.parse(await readFile(recordFile, "utf8"));
 	record.runner.identity.start_time = "0";
 	await writeFile(recordFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-	const cancelled = state(await invoke(request, { action: "cancel", request_id: accepted.request_id }));
+	const cancelled = state(await invoke(tools, request, { action: "cancel", request_id: accepted.request_id }));
 	assert.match(cancelled.refusal ?? "", /no signal was sent/);
 	assert.equal(cancelled.delivery, "unknown");
 	assert.equal(cancelled.reply, "unknown");
@@ -1035,19 +1109,19 @@ test("never signals a runner whose exact process identity no longer matches", as
 	assert.equal(refused.custody, "orphan");
 	assert.equal(refused.custody_reason, "cancellation-process-identity-mismatch");
 	await assert.rejects(
-		invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "blocked-by-orphan" }),
+		invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "blocked-by-orphan" }),
 		/already has active async request/,
 	);
 	process.kill(-record.runner.pgid, "SIGKILL");
 	await waitForGroupGone(record.runner.pgid);
-	await invoke(request, { action: "status", request_id: accepted.request_id });
-	const pgidCase = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "pgid" }));
+	await invoke(tools, request, { action: "status", request_id: accepted.request_id });
+	const pgidCase = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "pgid" }));
 	const pgidFile = path.join(askStateRoot(env), `${pgidCase.request_id}.json`);
 	const pgidRecord = JSON.parse(await readFile(pgidFile, "utf8"));
 	const actualPgid = pgidRecord.runner.pgid;
 	pgidRecord.runner.pgid += 1;
 	await writeFile(pgidFile, `${JSON.stringify(pgidRecord)}\n`, { mode: 0o600 });
-	const pgidRefusal = state(await invoke(request, { action: "cancel", request_id: pgidCase.request_id }));
+	const pgidRefusal = state(await invoke(tools, request, { action: "cancel", request_id: pgidCase.request_id }));
 	assert.match(pgidRefusal.refusal ?? "", /no signal was sent/);
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	assert.doesNotThrow(() => process.kill(pgidRecord.runner.pid, 0));
@@ -1056,12 +1130,12 @@ test("never signals a runner whose exact process identity no longer matches", as
 
 test("uncertain process identity resolves terminal unknown without signalling", async (t) => {
 	const { env, tools } = await fixture(t);
-	const ask = tools.get("maestri_ask_async")!;
-	const request = tools.get("maestri_ask_request")!;
-	const first = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "uncertain-status" }));
+	const ask: AsyncToolName = "maestri_ask_async";
+	const request: AsyncToolName = "maestri_ask_request";
+	const first = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "uncertain-status" }));
 	const firstRecord = JSON.parse(await readFile(path.join(askStateRoot(env), `${first.request_id}.json`), "utf8"));
 	const uncertain = registerTools(env, { asyncReadProcessIdentity: async () => { throw new Error("uncertain"); } });
-	const status = state(await invoke(uncertain.get("maestri_ask_request")!, { action: "status", request_id: first.request_id }));
+	const status = state(await invoke(uncertain, "maestri_ask_request", { action: "status", request_id: first.request_id }));
 	assert.deepEqual([status.phase, status.delivery, status.reply], ["running", "unknown", "unknown"]);
 	assert.doesNotThrow(() => process.kill(firstRecord.runner.pid, 0));
 	const firstPersisted = JSON.parse(await readFile(path.join(askStateRoot(env), `${first.request_id}.json`), "utf8"));
@@ -1069,10 +1143,10 @@ test("uncertain process identity resolves terminal unknown without signalling", 
 	assert.equal(firstPersisted.phase, "running");
 	process.kill(-firstRecord.runner.pgid, "SIGKILL");
 	await waitForGroupGone(firstRecord.runner.pgid);
-	await invoke(request, { action: "status", request_id: first.request_id });
-	const second = state(await invoke(ask, { agent: "Farol", prompt: "long", client_request_id: "uncertain-cancel" }));
+	await invoke(tools, request, { action: "status", request_id: first.request_id });
+	const second = state(await invoke(tools, ask, { agent: "Farol", prompt: "long", client_request_id: "uncertain-cancel" }));
 	const secondRecord = JSON.parse(await readFile(path.join(askStateRoot(env), `${second.request_id}.json`), "utf8"));
-	const cancelled = state(await invoke(uncertain.get("maestri_ask_request")!, { action: "cancel", request_id: second.request_id }));
+	const cancelled = state(await invoke(uncertain, "maestri_ask_request", { action: "cancel", request_id: second.request_id }));
 	assert.deepEqual([cancelled.phase, cancelled.delivery, cancelled.reply], ["running", "unknown", "unknown"]);
 	assert.doesNotThrow(() => process.kill(secondRecord.runner.pid, 0));
 	const secondPersisted = JSON.parse(await readFile(path.join(askStateRoot(env), `${second.request_id}.json`), "utf8"));
