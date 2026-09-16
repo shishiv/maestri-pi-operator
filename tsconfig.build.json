@@ -7,7 +7,7 @@
     "noEmitOnError": true,
     "declaration": true,
     "allowJs": true,
-    "checkJs": false,
+    "checkJs": true,
     "rewriteRelativeImportExtensions": true
   },
   "include": ["src/**/*.ts", "src/**/*.mjs"]
