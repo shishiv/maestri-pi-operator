@@ -14,6 +14,27 @@ import {
 
 const exec = promisify(execFile);
 const repository = fileURLToPath(new URL("../", import.meta.url));
+type FirstmateInput =
+	| { source_id: string; config_ref: string }
+	| { source_id: string; sequence: number; content: string };
+type FirstmateOperation = "source.poll" | "result.classify" | "result.terminal" | "result.silent";
+
+function runBin(bin: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, input: string) {
+	return new Promise<string>((resolve, reject) => {
+		const child = spawn(bin, args, { cwd, env, timeout: 5_000, killSignal: "SIGKILL", stdio: ["pipe", "pipe", "pipe"] });
+		const output: Buffer[] = [];
+		const errors: Buffer[] = [];
+		child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+		child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+		child.once("error", reject);
+		child.once("close", (code) => {
+			if (code === 0) resolve(Buffer.concat(output).toString());
+			else reject(new Error(Buffer.concat(errors).toString() || `mpo-extension exited ${code}`));
+		});
+		child.stdin.on("error", reject);
+		child.stdin.end(input);
+	});
+}
 
 test("installed tarball runs its external CLI and durable runner without a TypeScript loader", { timeout: 60_000 }, async (t) => {
 	const home = await mkdtemp(path.join(tmpdir(), "mpo-installed-"));
@@ -62,6 +83,31 @@ test("installed tarball runs its external CLI and durable runner without a TypeS
 	const manifest = JSON.parse(await readFile(path.join(installed, "package.json"), "utf8"));
 	const bin = path.join(installed, manifest.bin["mpo-extension"]);
 	const runtime = path.dirname(path.join(installed, manifest.pi.extensions[0]));
+	const consumerSource = path.join(consumer, "consumer.ts");
+	await writeFile(path.join(consumer, "package.json"), '{"private":true,"type":"module"}\n');
+	await writeFile(consumerSource, `
+import extension, { classifyPiReadiness } from "maestri-pi-operator";
+import { classifyPiReadiness as classifyViaSubpath } from "maestri-pi-operator/readiness";
+const loaded: typeof extension = extension;
+const verdict = classifyPiReadiness({
+  terminal_type: "pi", screen: "", truncated: false, encoding_valid: true,
+  captured_at_ms: 1, now_ms: 1, max_age_ms: 0,
+});
+const classify: typeof classifyPiReadiness = classifyViaSubpath;
+void loaded;
+void verdict;
+void classify;
+`);
+	await writeFile(path.join(consumer, "tsconfig.consumer.json"), JSON.stringify({
+		compilerOptions: {
+			target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext", strict: true,
+			noEmit: true, skipLibCheck: true, verbatimModuleSyntax: true, types: [],
+		},
+		files: [consumerSource],
+	}));
+	await exec(process.execPath, [path.join(repository, "node_modules/typescript/bin/tsc"), "-p", path.join(consumer, "tsconfig.consumer.json")], {
+		cwd: consumer, env, timeout: 10_000, maxBuffer: 1024 * 1024,
+	});
 	const manifestRequest = {
 		schema: "firstmate.extension-handshake-request.v1",
 		request_id: `sha256:${"1".repeat(64)}`,
@@ -174,6 +220,26 @@ process.exit(0);
 		assert.equal(envelope.request_id, requestId);
 		assert.equal(envelope.reply, "received");
 		assert.equal("content" in envelope, false, "the waiter must not consume or leak the reply body");
+		const requestBase = {
+			schema: "firstmate.extension-request.v1", host_protocol: 1,
+			extension_id: "org.maestri.pi-operator", extension_version: manifest.version,
+			package_digest: `sha256:${"2".repeat(64)}`, capability: "process-event-adapter",
+			capability_version: 1, adapter: "maestri-ask",
+		};
+		const invoke = async (operation: FirstmateOperation, input: FirstmateInput, digit: string) => JSON.parse(await runBin(
+			process.execPath, [bin, "invoke"], consumer, runtimeEnv,
+			JSON.stringify({ ...requestBase, request_id: `sha256:${digit.repeat(64)}`, operation, input }),
+		));
+		const polled = await invoke("source.poll", { source_id: "installed-source", config_ref: `ask:${requestId}?timeout=1` }, "3");
+		assert.equal(polled.result.status, "result");
+		assert.deepEqual(JSON.parse(polled.result.output), envelope);
+		const content = polled.result.output;
+		const classify = await invoke("result.classify", { source_id: "installed-source", sequence: 1, content }, "4");
+		assert.equal(classify.result.classification, "maestri-ask-terminal");
+		const terminalResult = await invoke("result.terminal", { source_id: "installed-source", sequence: 1, content }, "5");
+		assert.equal(terminalResult.result.value, true);
+		const silent = await invoke("result.silent", { source_id: "installed-source", sequence: 1, content }, "6");
+		assert.equal(silent.result.value, false);
 		assert.deepEqual(await readRequest(root, requestId), terminal, "waiting must not acknowledge the result");
 	});
 

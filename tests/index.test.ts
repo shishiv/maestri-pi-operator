@@ -4,24 +4,48 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import maestriPiOperator from "../src/index.ts";
 
 type Environment = Readonly<Record<string, string | undefined>>;
-type RegisteredHandler = (event: unknown, context: unknown) => unknown;
+interface TestEvent { readonly kind?: "test" }
+interface TestEventContext { readonly idle?: boolean }
+type RegisteredHandler = (event: TestEvent, context: TestEventContext) => void | Promise<void>;
+interface TestMessage {
+	content: string;
+	customType: string;
+	details: { digest: string };
+}
+interface DeliveryOptions {
+	deliverAs: "followUp" | "nextTurn";
+	triggerTurn?: true;
+}
+interface TestCommandContext {
+	sessionManager: { getEntries(): Array<TestMessage & { type: "custom_message" }> };
+	ui: { notify(message: string): void };
+}
+interface TestCommand {
+	handler(args: string, ctx: TestCommandContext): Promise<void>;
+}
 const contextKeys = ["MAESTRI_WORKSPACE_ID", "MAESTRI_SOCKET", "MAESTRI_TERMINAL_ID"] as const;
+
+function sessionEntry(message: TestMessage): TestMessage & { type: "custom_message" } {
+	return { type: "custom_message", ...message };
+}
 
 function loadExtension(env: Environment) {
 	const tools: string[] = [];
-	const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
-	const messages: Array<{ message: { content: string; customType: string; details: { digest: string } }; options: unknown }> = [];
+	const commands = new Map<string, TestCommand>();
+	const messages: Array<{ message: TestMessage; options: DeliveryOptions }> = [];
 	const handlers = new Map<string, RegisteredHandler[]>();
 	const pi = {
 		registerTool(tool: { name: string }) { tools.push(tool.name); },
-		registerCommand(name: string, command: { handler(args: string, ctx: unknown): Promise<void> }) { commands.set(name, command); },
+		registerCommand(name: string, command: TestCommand) { commands.set(name, command); },
 		on(name: string, handler: RegisteredHandler) {
 			const entries = handlers.get(name) ?? [];
 			entries.push(handler);
 			handlers.set(name, entries);
 		},
-		sendMessage(message: { content: string; customType: string; details: { digest: string } }, options: unknown) { messages.push({ message, options }); },
-	} as unknown as ExtensionAPI;
+		sendMessage(message: TestMessage, options: DeliveryOptions) { messages.push({ message, options }); },
+	};
+	// SAFETY: this harness implements every ExtensionAPI member exercised while the extension registers.
+	const extensionApi = pi as ExtensionAPI;
 	const previous = Object.fromEntries(contextKeys.map((key) => [key, process.env[key]]));
 	try {
 		for (const key of contextKeys) {
@@ -29,7 +53,7 @@ function loadExtension(env: Environment) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
-		maestriPiOperator(pi);
+		maestriPiOperator(extensionApi);
 	} finally {
 		for (const key of contextKeys) {
 			const value = previous[key];
@@ -75,8 +99,8 @@ test("maestri operator queues no-argument guidance and deduplicates it after rel
 	const loaded = loadExtension(env);
 	const notices: string[] = [];
 	const ctx = {
-		sessionManager: { getEntries: () => loaded.messages.map(({ message }) => ({ type: "custom_message", ...message })) },
-		ui: { notify: (message: string) => notices.push(message) },
+		sessionManager: { getEntries: () => loaded.messages.map(({ message }) => sessionEntry(message)) },
+		ui: { notify: (message: string) => { notices.push(message); } },
 	};
 	const command = loaded.commands.get("maestri-operator");
 	assert.ok(command);
