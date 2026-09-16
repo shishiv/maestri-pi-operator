@@ -22,11 +22,18 @@ role bootstraps or automatic team setup.
 
 Requires **Linux**, **Node.js 24+**, and **Pi running in a Maestri terminal**.
 
+Before upgrading from the JSON-file lock protocol, drain or stop every old
+Pi/runner that can write to the store. Mixed-version writers are unsupported;
+an absent lock file does not prove quiescence. Existing legacy lock markers
+cause a refusal and are never removed automatically. Preserve receipts and
+captures when resolving legacy artifacts after the coordinated stop. See
+[the lock upgrade decision](docs/adr/0003-atualizacao-dos-locks-com-quiescencia.md).
+
 ```sh
 pi install npm:maestri-pi-operator
 ```
 
-Run `/reload` in an existing Pi session. To pin this release:
+After that prerequisite, run `/reload` in an existing Pi session. To pin this release:
 
 ```sh
 pi install npm:maestri-pi-operator@0.3.3
@@ -45,9 +52,11 @@ Android control additionally requires an Android SDK and an available emulator
 or a phone authorized for USB debugging. The extension does not install or
 configure them.
 
-> **Validation status:** transport tests and model-backed smoke tests pass.
-> Real web DOM, forms, click, PNG capture and navigation were verified. Screenshot
-> fidelity and a real Android device journey remain unverified. See [known limits](#known-limits).
+> **Historical validation evidence:** a review for Maestri 0.16.0 recorded
+> transport tests and model-backed smoke passing, and real web DOM, forms, click,
+> PNG capture and navigation verified. Screenshot fidelity and a real Android
+> device journey remained unverified. This history does not certify later
+> contract changes; final verification evidence is maintained separately.
 
 ## Try it
 
@@ -108,13 +117,17 @@ original request; a changed payload is rejected. Pending results never expose
 partial replies.
 
 When a request finishes, Pi receives an `mpo.ask-terminal` follow-up with the
-next action. Reading `result` acknowledges it. A restart may reannounce an
-unacknowledged result once.
+next action. Reading `result` is the Pi acknowledgement. A restart may
+reannounce an unacknowledged result once. Firstmate acknowledgement is a
+separate external concern.
 
 - The destination must be an idle, supported Pi, with no other active async ask.
 - Requests are private to the Maestri workspace and calling terminal.
-- Idempotency lasts while the receipt is retained: up to seven days and the
-  newest 200 terminal requests, whichever keeps fewer records.
+- Idempotency lasts only while the receipt is retained. Retention eligibility
+  considers seven days and the newest 200 terminal requests, with the smaller
+  resulting set prevailing. Cleanup occurs opportunistically during activity:
+  there is no hard deletion deadline or minimum retention guarantee, and this
+  does not authorize a resend when a result is pending or delivery is unknown.
 - Structured receipts store only the prompt digest and byte count. The private
   terminal capture can contain rendered prompt and reply text until retention
   removes it; do not use async asks for secrets.
@@ -173,12 +186,14 @@ These diagnostics do not turn unknown delivery into permission to resend.
 
 The extension uses an executable `MAESTRI_CLI`, falling back to `maestri` on
 `PATH`. Maestri context requires `MAESTRI_WORKSPACE_ID` and `MAESTRI_SOCKET`;
-async asks also need `MAESTRI_TERMINAL_ID`. Credential values are never needed
-in chat.
+async asks also need `MAESTRI_TERMINAL_ID`. The waiter and Firstmate adapter
+require both `MAESTRI_WORKSPACE_ID` and `MAESTRI_TERMINAL_ID`; missing either
+scope value is an error. Credential values are never needed in chat.
 
 ## Known limits
 
-The following behavior was observed with **Maestri 0.16.0**:
+The following limits and evidence requirements were recorded for **Maestri 0.16.0**;
+later contract changes require separate final verification:
 
 | Limit | What it means |
 | --- | --- |
@@ -201,11 +216,16 @@ npm run check
 npm run smoke
 ```
 
-`check` runs type checking, a clean JavaScript build and behavioral tests,
-including a tarball installed into isolated `node_modules`. `npm pack` builds
-the distributable automatically. `smoke` uses **GPT-6 Astra**
-against a controlled CLI and requires model access. It is not a live Maestri
+`check` runs lint (all generic anti-slop rules and a maximum complexity of 10),
+type checking, a clean JavaScript build and behavioral tests, including a
+tarball installed into isolated `node_modules`.
+`npm pack` builds the distributable automatically. `smoke` uses **GPT-6 Astra**
+against a controlled CLI and requires model access; it is not a live Maestri
 journey.
+
+Smoke events, per-call argv and the first failure are retained under
+`.artifacts/smoke-v01/` (override with `MPO_SMOKE_ARTIFACTS_DIR`). The deterministic
+smoke-harness tests exercise this recording without a model or network.
 
 Try the checkout after `npm run build`, without changing Pi settings:
 
@@ -226,13 +246,22 @@ Local investigation artifacts live in the ignored `.artifacts/` directory.
 <details>
 <summary><strong>External waiter and Firstmate integration</strong></summary>
 
-`mpo-extension wait --request <uuid> [--timeout <1-55>]` waits for terminal
-metadata without consuming the reply or changing request state. Ordinary
-timeout is silent and successful. The envelope contains no prompt or reply text.
+`mpo-extension wait --request <uuid> [--timeout <1-55>]` is a read-only wait
+within the explicit workspace and calling-terminal scope. The scope environment
+is mandatory, including for Firstmate: provide `MAESTRI_WORKSPACE_ID` and
+`MAESTRI_TERMINAL_ID`. A UUID alone is not a cross-scope capability. It waits
+for terminal metadata without consuming the reply or
+changing request state. Ordinary timeout is silent and successful. The envelope
+contains no prompt or reply text.
 
 The executable also implements Firstmate's `process-event-adapter/1` as
 `maestri-ask`, declared in [firstmate-extension.json](firstmate-extension.json).
-Firstmate owns capture, wake publication, acknowledgement and re-arming.
+Firstmate owns capture, wake publication, acknowledgement and re-arming within
+that same scope. Pending and result are read-only observations; neither implies
+retry. Claims and acknowledgements can cause a notice to be repeated, while
+failures can produce no notice; there is no universal delivery guarantee.
+Consumers must therefore make notice handling idempotent without assuming
+at-least-once delivery.
 
 </details>
 
@@ -254,10 +283,7 @@ automatic manifest migration, replay or deletion of canvas resources.
 
 </details>
 
-## Lint anti-slop e dívida conhecida
+## Lint anti-slop
 
-`npm run lint` roda as regras anti-slop. Elas entraram em 0.3.3 sobre código que
-não foi escrito para elas: **109 achados pré-existentes** (src e tests). As regras
-ficam **ligadas como `warn`**, nunca desligadas, para o gate passar sem esconder
-nada. Baixe cada regra para `error` conforme a dívida daquela regra chegar a zero.
-Código novo não deve acrescentar achado.
+`npm run lint` exige as quinze regras anti-slop como `error`, complexidade máxima
+10 e zero warnings. A configuração é única; o gate não mantém dívida em `warn`.

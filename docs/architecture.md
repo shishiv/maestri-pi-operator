@@ -8,16 +8,15 @@ e montagem automática do canvas ficam fora deste pacote.
 ## Entrada e execução
 
 `src/index.ts` exige `MAESTRI_WORKSPACE_ID` e `MAESTRI_SOCKET` antes de registrar
-qualquer superfície. Sem ambas, não registra tools, hooks ou skills. Dentro do
-Maestri, registra catorze tools de comunicação, roles, notas e portais, além do
-notificador de respostas async. Também fornece seis skills operacionais por
-`resources_discover`; elas ficam em `resources/skills`, fora da descoberta
-estática do pacote. Não injeta instruções de planejamento no startup.
+qualquer superfície. Sem ambas, não registra tools, hooks ou comandos. Dentro do
+Maestri, registra catorze tools de comunicação, roles, notas e portais, o
+notificador de respostas async e o comando opt-in `/maestri-operator`. O comando
+só injeta orientação quando chamado explicitamente; não há instrução de
+planejamento, startup operacional ou montagem automática de equipe.
 
-O gate controla somente recursos deste pacote. Cópias das mesmas skills gravadas
-por versões anteriores do aplicativo nos diretórios globais do agente precisam
-ser retiradas pelo instalador que as criou; a API de extensão do Pi não remove
-skills descobertas de outras origens.
+O gate controla somente recursos deste pacote. Skills globais de instalações
+anteriores pertencem ao instalador que as criou; este pacote não as descobre,
+ativa, remove ou migra.
 
 A fonte permanece em TypeScript e MJS. `scripts/build.mjs` gera `dist/` limpo
 com o compilador local, reescrevendo imports relativos para JavaScript. O pacote
@@ -91,20 +90,37 @@ podem ser linhas indentadas do rascunho. Uma linha de status após o footer é
 permitida somente com composer vazio e diretório reconhecido. O texto do status
 não comprova prontidão. Layouts desconhecidos continuam recusados.
 
-`src/ask-store.ts` persiste o recibo antes do spawn. O escopo é derivado de
-workspace e terminal sob
+O recibo é persistido antes do spawn. O escopo é derivado de workspace e terminal sob
 `${XDG_STATE_HOME:-~/.local/state}/maestri-pi-operator/ask/scopes`.
 Diretórios usam modo `0700` e arquivos `0600`. O recibo guarda somente digest e
 tamanho do prompt, não seu corpo nem o environment. A captura sanitizada do
 terminal é outro arquivo privado e pode repetir o prompt renderizado e a resposta
-até a retenção removê-los. Registros estrangeiros ou legados sem escopo são recusados.
+até a retenção removê-los. Registros estrangeiros ou legados sem escopo são
+recusados; a normalização de registros legados deve ser estrita, sem completar
+campos que não possam ser comprovados.
+
+`src/ask-receipt.ts` valida o contrato persistido; `src/ask-store.ts` possui
+transações com snapshot independente e no-op explícito. Metadados de
+notificação não alteram fatos terminais nem sua versão. `src/receipt-lock.ts`
+usa compare-and-swap SQLite para evitar que um reclaimer remova o sucessor;
+identidade do dono do lock guarda digest de cmdline, não o texto do comando.
+O esquema de coordenação é validado e o bootstrap é serializado.
+
+A troca do protocolo JSON antigo exige quiescência dos produtores anteriores.
+Markers legados causam recusa, sem limpeza automática; sua ausência não prova
+que um escritor antigo foi encerrado. Não há convivência de versões dos dois
+protocolos. Recibos e capturas são preservados; consulte a
+[ADR de atualização](adr/0003-atualizacao-dos-locks-com-quiescencia.md).
 
 Replay da mesma chave, agente e digest de prompt retorna o mesmo request ID.
-Payload diferente conflita antes do envio. A garantia termina com a retenção
-do registro: sete dias e os 200 terminais mais recentes, prevalecendo o
-conjunto menor.
+Payload diferente conflita antes do envio. A elegibilidade de retenção considera
+sete dias e os 200 pedidos em estado terminal mais recentes, prevalecendo o conjunto
+menor. A limpeza ocorre oportunisticamente durante atividade, sem hard deadline
+de apagamento e sem garantia de retenção mínima. Não há daemon de retenção a
+pressupor; a ausência momentânea do registro não autoriza reenviar.
 
-`src/ask-runner.mjs` executa um único ask. Somente seu handshake autenticado
+O processo pai conserva a custódia do pedido e o runner executa um único ask.
+Somente o handshake autenticado do runner
 pode avançar o pedido de accepted para running. Restart reconcilia PID, PGID,
 o instante de criação em `/proc` e o cmdline completo antes de confiar ou
 sinalizar o grupo. Identidade ambígua nunca autoriza um sinal ou reenvio.
@@ -114,7 +130,7 @@ Falhas de startup retêm apenas códigos de erro reconhecidos, sem tratar stderr
 como resposta do peer. Status e result projetam reason, termination e exit_code
 sanitizados; não alteram retrospectivamente a certeza de entrega do recibo.
 
-Delivery e reply são estados separados. O runner sanitiza a captura antes de
+Entrega e resposta são estados separados. O runner sanitiza a captura antes de
 persisti-la. `src/reply-envelope.ts` isola uma resposta pelos marcadores do
 request ID. Envelopes de outros pedidos fora da resposta atual são histórico,
 não duplicatas. Marcadores atuais ausentes, duplicados, malformados ou
@@ -127,8 +143,11 @@ texto parcial.
 Pi está ocioso. O registro guarda a notificação e seu claim de processo.
 O aviso inclui a orientação de ler `result` daquele pedido uma vez, sem reenvio,
 para permitir a retomada mesmo em uma sessão sem briefing anterior.
-Um claim estrangeiro vivo impede outro envio. Restart pode repetir uma
-notificação não reconhecida uma vez por sessão. Ler result faz o ack.
+Um claim estrangeiro vivo impede outro envio. Antes de chamar `sendMessage`, o
+estado `dispatching` é persistido; se a gravação posterior falhar, restart não
+reenvia um aviso cuja entrega ficou incerta. Falha síncrona de envio volta a
+`pending`, libera o claim e só é reavaliada na próxima borda idle. Ler result
+faz o ack.
 
 O notifier reavalia também em `agent_settled`, porque `agent_end` pode ainda
 ocorrer durante busy. Reconfere idle após IO, coalesce eventos sobrepostos e
@@ -139,17 +158,25 @@ geram um aviso genérico na UI ou stderr, sem conteúdo do journal. O aviso não
 repete até um scan bem-sucedido. Nenhum recibo é apagado para esconder a falha;
 um evento posterior permite nova verificação, sem reenviar prompts.
 
-`src/ask-terminal.ts` define o envelope canônico `mpo.ask-terminal.v1`,
-limitado a 4 KiB e sem texto de prompt ou resposta. `src/ask-waiter.ts` e
+O contrato canônico `mpo.ask-terminal.v1`, definido por `src/ask-terminal.ts`,
+é limitado a 4 KiB e não contém texto de prompt ou resposta. `src/ask-waiter.ts` e
 `src/extension-cli.mjs`, exposto por `bin/mpo-extension`, oferecem espera finita
-e somente leitura, além do adapter
-Firstmate `maestri-ask`. Eles não fazem claim, ack, cancelamento ou reenvio.
-Captura, publicação, acknowledgement e re-arm externos pertencem ao Firstmate.
+e somente leitura, além do adapter Firstmate `maestri-ask`. O contrato de
+integração exige `MAESTRI_WORKSPACE_ID` e `MAESTRI_TERMINAL_ID` no ambiente;
+UUID não é capacidade cross-scope.
+Eles não fazem claim, acknowledgement, cancelamento ou reenvio.
+
+O Aviso Pi pode ser duplicado por claims, acknowledgement ou restart, mas uma
+falha também pode resultar em nenhum aviso; não há garantia universal de entrega.
+O Reconhecimento Pi ocorre quando o chamador lê o resultado; o acknowledgement
+externo, a publicação e o re-arm pertencem ao Firstmate e não substituem essa
+leitura. Pending e result são observações sem retry implícito.
 
 ## Verificação
 
-`npm run check` cobre tradução para argv, texto literal, rejeições anteriores
-ao efeito, limites de saída, cancelamento e os contratos de persistência async.
+`npm run check` exige lint sem warnings (anti-slop e complexidade máxima 10),
+typecheck de TS e MJS e os testes locais. Cobre tradução para argv, texto literal, rejeições anteriores ao
+efeito, limites de saída, cancelamento e os contratos de persistência async.
 `npm run smoke` verifica o carregamento e chamadas nativas no Pi com CLI
 controlado. O smoke ao vivo é separado e exige um terminal descartável.
 
@@ -158,7 +185,16 @@ exercita o executável externo, o runner, o waiter e a entrada pública. O cache
 é vazio; somente os peers declarados são fornecidos por links explícitos para a
 instalação de desenvolvimento versionada. O pacote testado não é um link para o
 checkout. A criação do recibo e o CLI são controlados; isso não substitui uma jornada Pi/Maestri real usando
-o mesmo pacote instalado. Os testes determinísticos não exigem modelo pago.
+o mesmo pacote instalado. Os testes locais não substituem jornadas Pi/Maestri,
+web ou Android reais; quando o ambiente ou as fixtures não estiverem disponíveis,
+a evidência deve ser registrada como **BLOCKED**, não como PASS.
 
-O pacote não possui autoridade sobre backlog, branches, worktrees ou entrega.
+O build compila e valida em staging antes de substituir `dist`, com rollback
+se a publicação falhar; não promete troca atômica sem janela para leitores.
+O teste instalado compila um consumidor TypeScript e verifica handshake e
+operações Firstmate pelo executável distribuído. Os testes do harness de smoke
+usam Pi controlado sem modelo; o smoke model-backed mantém eventos, argv e a
+primeira falha em `.artifacts/smoke-v01/`.
+
+O pacote não possui autoridade sobre backlog, branches, worktrees ou entrega de trabalho.
 O conteúdo dos papéis é fornecido pelo chamador, não por este pacote.

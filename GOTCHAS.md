@@ -60,7 +60,6 @@ real; nenhum é hipótese.
 
 ## Lint
 
-- **anti-slop entrou em 0.3.3 sobre código que não foi escrito para ele:**
-  109 achados pré-existentes. As regras ficam ligadas como `warn`, nunca
-  desligadas. Baixe para `error` por regra conforme a dívida daquela regra
-  zerar. Código novo não deve acrescentar achado.
+- **O ratchet anti-slop agora é integral:** as quinze regras ficam em `error`,
+  complexidade máxima é 10 e warnings falham o lint. A dívida histórica da
+  0.3.3 foi zerada; não rebaixe severidade nem crie uma segunda configuração.

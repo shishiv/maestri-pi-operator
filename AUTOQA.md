@@ -17,8 +17,10 @@ secundária, não compensação para falha, perda de texto ou reenvio indevido.
   O gate usa cache npm vazio e peers declarados da instalação de desenvolvimento;
   não deve depender de downloads ou de metadata guardada no cache do operador.
 - Integração real: Pi/Maestri, permissões e fixtures próprias. Confirmar que o
-  destinatário recebeu a tarefa antes de declarar trabalho iniciado. Registrar
-  ausência de Maestro/SDK/dispositivo como BLOCKED, não PASS.
+  destinatário recebeu o Pedido antes de registrar o estado como recebido.
+  Registrar ausência de Maestro/SDK/dispositivo como BLOCKED, não PASS.
+- Firstmate: fornecer sempre o ambiente explícito de workspace e terminal. Um
+  UUID não concede leitura fora desse escopo.
 
 Preservar a primeira falha e seu diagnóstico. Não repetir até ficar verde,
 transformar bloqueio em sucesso ou contar uma ação de portal como prova de todas.
@@ -42,17 +44,18 @@ transformar bloqueio em sucesso ou contar uma ação de portal como prova de tod
 1. Descoberta, inspeção e recusa de destinatários não prontos antes do envio.
 2. Ask síncrono e async com respostas exclusivas, inclusive pedidos consecutivos
    com respostas anteriores ainda visíveis na tela.
-3. Resultado pendente sem conteúdo parcial, replay pela mesma chave, conflito
-   de payload e exclusão de outro pedido ativo no mesmo agente.
+3. Resultado pendente sem conteúdo parcial e sem retry, replay pela mesma chave,
+   conflito de payload e exclusão de outro pedido ativo no mesmo agente.
    Incluir recibo antigo cujo prompt excede o novo limite codificado: recuperação
    deve funcionar sem reenvio; uma nova chave deve ser recusada antes do efeito.
    Confirmar que o recibo estruturado não contém o prompt. Tratar a captura privada
    como potencial portadora do texto renderizado; não usar segredos na fixture.
-4. Cancelamento, descarte de parcial e consulta posterior sem reenvio implícito.
+4. Cancelamento, descarte de parcial e consulta posterior de pending/result sem
+   reenvio implícito.
 5. Encerramento do chamador enquanto o runner trabalha, recuperação do mesmo
    pedido, notificação em Pi real, reanúncio sem ack e supressão depois do ack.
    Incluir conclusão enquanto o chamador está busy, passagem a idle e consumo
-   automático de result, sem um prompt manual do coordenador.
+   automático de result, sem exigir um novo prompt manual.
 6. Isolamento por workspace e terminal. Nunca altere recibos de trabalho real
    para simular outra identidade ou crash.
 7. Role list, show e create com escopo local. Note create, read com intervalos,
@@ -82,8 +85,15 @@ transformar bloqueio em sucesso ou contar uma ação de portal como prova de tod
 18. Falha de leitura do journal em scan agendado: aviso sem dados sensíveis,
     nenhuma rejeição não tratada, nenhum ack falso e recuperação em evento posterior.
 19. Contexto ausente: sem `MAESTRI_WORKSPACE_ID` ou sem `MAESTRI_SOCKET`, o
-    pacote não registra tools, hooks nem skills. Com ambas, registra as catorze
-    tools e descobre exatamente as seis skills Maestri empacotadas.
+    pacote não registra tools, hooks nem o comando opt-in. Com ambas, registra
+    as catorze tools e `/maestri-operator`, sem injeção automática de contexto.
+20. Normalização legada estrita: aceitar apenas campos e estados comprováveis,
+    recusando registros ambíguos sem completar defaults perigosos.
+21. Aviso sem garantia universal de entrega: testar duplicação por claim,
+    acknowledgement ou restart, possibilidade de nenhum aviso, idempotência do
+    consumidor e separação entre Reconhecimento Pi e acknowledgement Firstmate.
+22. Custódia pai/runner: testar handshake autenticado, restart, identidade
+    ambígua, cancelamento e ausência de sinal ou reenvio sem prova suficiente.
 
 Leia o diff de cada rodada e acrescente os casos novos. Um teste unitário verde
 não substitui uma jornada de integração. Registre separadamente casos ao vivo,
@@ -99,7 +109,7 @@ protocolo do harness.
 O `session_start` pode inserir um aviso antes de o assinante RPC começar a emitir
 eventos. Após `get_state`, leia `get_messages` para observar mensagens iniciais.
 Não conclua que o notificador falhou só porque não houve `message_end` desse aviso.
-Para trabalho novo, aguarde `agent_settled`, não apenas `agent_end`. Feche stdin
+Para pedidos novos, aguarde `agent_settled`, não apenas `agent_end`. Feche stdin
 para encerrar o chamador e continue drenando a saída até o processo terminar.
 
 ## Evals do modelo
@@ -119,6 +129,18 @@ corrija a ambiguidade e faça uma repetição diagnóstica.
 Um CLI controlado avalia decisões do modelo e contratos da extensão. Não o
 apresente como prova de compatibilidade real. Não avance para o app inteiro
 enquanto houver bloqueadores ou itens obrigatórios sem prova.
+
+## Contratos para o runbook futuro
+
+Todo procedimento deve registrar o ambiente de escopo antes de consultar
+pending ou result, inclusive no Firstmate. Pending e result são leituras sem
+retry; entrega desconhecida também não autoriza novo envio. O runbook deve
+descrever a normalização legada como estrita, o Aviso Pi como sujeito a
+duplicação ou ausência e o acknowledgement Firstmate como distinto do
+Reconhecimento Pi.
+Deve ainda nomear os papéis pai e runner sem confundi-los, preservar o transporte
+sem backlog, canvas automático, skills ou roles operacionais e separar evidência
+local de jornada real.
 
 ## Evidência e entrega
 
