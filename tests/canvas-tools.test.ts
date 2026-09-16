@@ -3,18 +3,28 @@ import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Assert } from "typebox/value";
 import { registerCanvasTools } from "../src/canvas-tools.ts";
 import { MAESTRI_CHECK_TIMEOUT_MS, type MaestriExec, type MaestriExecOptions } from "../src/maestri.ts";
+import { createPiToolHarness } from "./support/pi-tools.ts";
+
+interface CanvasTestParams {
+	name?: string;
+	prompt?: string;
+	content?: string;
+	stack?: string;
+	oldText?: string;
+	newText?: string;
+	offset?: number;
+	limit?: number;
+}
 
 async function fixture(t: TestContext, execute?: MaestriExec) {
 	const dir = await mkdtemp(path.join(tmpdir(), "maestri-canvas-"));
 	t.after(() => rm(dir, { recursive: true, force: true }));
 	const cli = path.join(dir, "maestri");
 	await writeFile(cli, '#!/usr/bin/env node\nconsole.log(JSON.stringify({ argv: process.argv.slice(2), token: process.env.MAESTRI_TOKEN }));\n', { mode: 0o700 });
-	const tools = new Map<string, Pick<ToolDefinition, "parameters" | "execute">>();
-	registerCanvasTools({ registerTool(tool) { tools.set(tool.name, tool); } }, {
+	const harness = createPiToolHarness(dir);
+	registerCanvasTools(harness.registrar, {
 		env: {
 			HOME: dir,
 			XDG_STATE_HOME: path.join(dir, "state"),
@@ -28,15 +38,9 @@ async function fixture(t: TestContext, execute?: MaestriExec) {
 		platform: "linux",
 		execute,
 	});
-	const ctx = { cwd: dir } as ExtensionContext;
 	return {
 		dir,
-		async invoke(name: string, params: Record<string, unknown>, signal?: AbortSignal) {
-			const tool = tools.get(name);
-			assert.ok(tool, name);
-			Assert(tool.parameters, params);
-			return tool.execute("call", params, signal, undefined, ctx);
-		},
+		invoke(name: string, params: CanvasTestParams, signal?: AbortSignal) { return harness.invoke(name, params, signal); },
 	};
 }
 

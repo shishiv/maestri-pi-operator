@@ -1,12 +1,16 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { invokeMaestri, type MaestriRuntimeOptions } from "./maestri.ts";
+import type { PiToolRegistrar } from "./pi-tool.ts";
 
 const nameSchema = Type.String({ minLength: 1 });
 const MAX_TEXT_BYTES = 65_536;
 
 function assertName(name: string): void {
-	if (!name || name.trim() !== name || name.startsWith("-") || /[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+	const hasControlCharacter = Array.from(name).some((character) => {
+		const code = character.codePointAt(0);
+		return code !== undefined && ((code >= 0 && code <= 31) || (code >= 127 && code <= 159));
+	});
+	if (!name || name.trim() !== name || name.startsWith("-") || hasControlCharacter) {
 		throw new Error("name must be non-empty, trimmed, single-line, contain no control characters, and not start with '-'");
 	}
 }
@@ -20,7 +24,7 @@ function encodeCliText(text: string): string {
 }
 
 export function registerCanvasTools(
-	pi: Pick<ExtensionAPI, "registerTool">,
+	pi: PiToolRegistrar,
 	options: MaestriRuntimeOptions = {},
 ): void {
 	pi.registerTool({

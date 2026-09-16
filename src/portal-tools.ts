@@ -1,9 +1,9 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { DEVICE_ACTIONS, WEB_ACTIONS, portalCommand } from "./portal-command.ts";
 import { invokePortal } from "./portal-output.ts";
 import type { MaestriRuntimeOptions } from "./maestri.ts";
+import type { PiToolRegistrar } from "./pi-tool.ts";
 
 const name = Type.String({ minLength: 1, maxLength: 256 });
 const text = Type.String({ maxLength: 65_536 });
@@ -11,7 +11,7 @@ const target = Type.Optional(Type.String({ minLength: 1, maxLength: 256, descrip
 const direction = Type.Optional(StringEnum(["up", "down", "left", "right"]));
 const amount = Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000, description: "Scroll pixels; default 300" }));
 
-export function registerPortalTools(pi: Pick<ExtensionAPI, "registerTool">, options: MaestriRuntimeOptions = {}): void {
+export function registerPortalTools(pi: PiToolRegistrar, options: MaestriRuntimeOptions = {}): void {
 	pi.registerTool({
 		name: "maestri_portal",
 		label: "Maestri web portal",

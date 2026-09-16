@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { Check } from "typebox/value";
 
 const CUSTOM_TYPE = "mpo.maestri-operator";
+const InvocationDetailsSchema = Type.Object({ digest: Type.String() });
 
 const OPERATOR_GUIDANCE = `Maestri operator context:
 - Discover exact connected names with maestri_list before addressing an agent, note, role, or portal.
@@ -14,20 +17,12 @@ function invocationDigest(args: string): string {
 	return createHash("sha256").update(args, "utf8").digest("hex");
 }
 
-function hasInvocation(ctx: { sessionManager: { getEntries(): Array<unknown> } }, digest: string): boolean {
-	return ctx.sessionManager.getEntries().some((entry) => (
-		typeof entry === "object"
-		&& entry !== null
-		&& "type" in entry
-		&& entry.type === "custom_message"
-		&& "customType" in entry
-		&& entry.customType === CUSTOM_TYPE
-		&& "details" in entry
-		&& typeof entry.details === "object"
-		&& entry.details !== null
-		&& "digest" in entry.details
-		&& entry.details.digest === digest
-	));
+function hasInvocation(ctx: ExtensionCommandContext, digest: string): boolean {
+	return ctx.sessionManager.getEntries().some((entry) => {
+		if (entry.type !== "custom_message" || entry.customType !== CUSTOM_TYPE) return false;
+		if (!Check(InvocationDetailsSchema, entry.details)) return false;
+		return entry.details.digest === digest;
+	});
 }
 
 export function registerMaestriOperatorCommand(pi: ExtensionAPI): void {
