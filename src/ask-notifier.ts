@@ -1,16 +1,53 @@
 import { watch, type FSWatcher } from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	atomicWriteRecord,
 	ensureAskStateRoot,
 	listRequests,
 	readProcessIdentity,
-	readRequest,
 	sameIdentity,
+	transactRequest,
+	type AskRequestRecord,
 	type ProcessIdentity,
-	withRequestLock,
 } from "./ask-store.ts";
-import { canonicalJson, terminalEnvelope } from "./ask-terminal.ts";
+import {
+	canonicalJson,
+	terminalEnvelope,
+	type AskTerminalFollowup,
+} from "./ask-terminal.ts";
+
+export interface NotifierContext {
+	isIdle(): boolean;
+	hasUI?: boolean;
+	ui?: { notify(message: string, level: "warning"): void };
+}
+
+export type NotifierEventName = "session_start" | "agent_end" | "agent_settled" | "session_shutdown";
+export interface NotifierEvent {}
+export type NotifierHandler = (event: NotifierEvent, ctx: NotifierContext) => void | Promise<void>;
+export interface AskNotifierMessage {
+	customType: "mpo.ask-terminal";
+	content: string;
+	display: true;
+	details: { request_id: string; digest: string };
+}
+export interface AskNotifierPi {
+	on(name: NotifierEventName, handler: NotifierHandler): void;
+	sendMessage(message: AskNotifierMessage, options: { deliverAs: "followUp"; triggerTurn: true }): void;
+}
+
+function createNotificationMessage(requestId: string, digest: string): AskNotifierMessage {
+	const followup: AskTerminalFollowup = {
+		schema: "mpo.ask-terminal-followup.v1",
+		request_id: requestId,
+		digest,
+		next_action: "Call maestri_ask_request with action=result and this request_id, once. Do not resend the prompt.",
+	};
+	return {
+		customType: "mpo.ask-terminal",
+		content: canonicalJson(followup),
+		display: true,
+		details: { request_id: requestId, digest },
+	};
+}
 
 export interface AskNotifierOptions {
 	env?: Environment;
@@ -20,12 +57,16 @@ export interface AskNotifierOptions {
 }
 
 type Environment = Readonly<Record<string, string | undefined>>;
-type NotifierContext = { isIdle(): boolean };
+
+function isNotificationCandidate(record: AskRequestRecord): boolean {
+	if (record.phase !== "terminal") return false;
+	return record.notification.state !== "acked" && record.notification.state !== "dispatching";
+}
 
 class AskNotifier {
 	private readonly attempted = new Set<string>();
 	private readonly failed = new Set<string>();
-	private readonly pi: ExtensionAPI;
+	private readonly pi: AskNotifierPi;
 	private readonly ctx: NotifierContext;
 	private readonly root: string;
 	private readonly owner: { pid: number; identity: ProcessIdentity };
@@ -40,7 +81,7 @@ class AskNotifier {
 	private failureReported = false;
 
 	constructor(
-		pi: ExtensionAPI,
+		pi: AskNotifierPi,
 		ctx: NotifierContext,
 		root: string,
 		owner: { pid: number; identity: ProcessIdentity },
@@ -70,7 +111,7 @@ class AskNotifier {
 	}
 
 	async scan(): Promise<void> {
-		if (this.stopped || !this.ctx.isIdle()) return;
+		if (!this.canDispatch()) return;
 		if (this.scanning) {
 			this.rescanRequested = true;
 			return;
@@ -79,39 +120,7 @@ class AskNotifier {
 		this.scanning = new Promise<void>((resolve) => { finish = resolve; });
 		try {
 			for (const record of (await listRequests(this.root)).slice(0, 256)) {
-				if (this.stopped || !this.ctx.isIdle()) return;
-				if (record.phase !== "terminal" || record.notification.state === "acked" || record.notification.state === "dispatching") continue;
-				const key = `${record.request_id}:${terminalEnvelope(record).digest}`;
-				if (this.attempted.has(key)) continue;
-				const claimed = await this.claim(record.request_id);
-				if (!claimed) continue;
-				// Lock/identity IO can outlive idle or session shutdown. A claim is not a send.
-				if (this.stopped || !this.ctx.isIdle()) return;
-				const envelope = terminalEnvelope(claimed);
-				await this.markDispatching(claimed.request_id, envelope.digest);
-				if (this.stopped || !this.ctx.isIdle()) {
-					await this.markFailed(claimed.request_id, envelope.digest);
-					continue;
-				}
-				this.attempted.add(`${claimed.request_id}:${envelope.digest}`);
-				try {
-					this.pi.sendMessage({
-						customType: "mpo.ask-terminal",
-						content: canonicalJson({
-							schema: "mpo.ask-terminal-followup.v1",
-							request_id: claimed.request_id,
-							digest: envelope.digest,
-							next_action: "Call maestri_ask_request with action=result and this request_id, once. Do not resend the prompt.",
-						}),
-						display: true,
-						details: { request_id: claimed.request_id, digest: envelope.digest },
-					}, { deliverAs: "followUp", triggerTurn: true });
-				} catch {
-					this.failed.add(key);
-					await this.markFailed(claimed.request_id, envelope.digest);
-					continue;
-				}
-				await this.markSent(claimed.request_id, envelope.digest);
+				if (await this.processRecord(record)) return;
 			}
 			this.failureReported = false;
 		} catch {
@@ -130,6 +139,42 @@ class AskNotifier {
 		}
 	}
 
+	private async processRecord(record: AskRequestRecord): Promise<boolean> {
+		if (!this.canDispatch()) return true;
+		if (!isNotificationCandidate(record)) return false;
+		const key = `${record.request_id}:${terminalEnvelope(record).digest}`;
+		if (this.attempted.has(key)) return false;
+		const claimed = await this.claim(record.request_id);
+		if (!claimed) return false;
+		// Lock/identity IO can outlive idle or session shutdown. A claim is not a send.
+		if (!this.canDispatch()) return true;
+		const envelope = terminalEnvelope(claimed);
+		await this.markDispatching(claimed.request_id, envelope.digest);
+		if (!this.canDispatch()) {
+			await this.markFailed(claimed.request_id, envelope.digest);
+			return true;
+		}
+		await this.deliver(claimed, envelope.digest);
+		return false;
+	}
+
+	private canDispatch(): boolean {
+		return !this.stopped && this.ctx.isIdle();
+	}
+
+	private async deliver(record: AskRequestRecord, digest: string): Promise<void> {
+		const key = `${record.request_id}:${digest}`;
+		this.attempted.add(key);
+		try {
+			this.pi.sendMessage(createNotificationMessage(record.request_id, digest), { deliverAs: "followUp", triggerTurn: true });
+		} catch {
+			this.failed.add(key);
+			await this.markFailed(record.request_id, digest);
+			return;
+		}
+		await this.markSent(record.request_id, digest);
+	}
+
 	retryFailed(): void {
 		for (const key of this.failed) this.attempted.delete(key);
 		this.failed.clear();
@@ -146,8 +191,7 @@ class AskNotifier {
 	}
 
 	private async claim(requestId: string) {
-		return withRequestLock(this.root, requestId, async () => {
-			const record = await readRequest(this.root, requestId);
+		return transactRequest(this.root, requestId, async (record) => {
 			if (record.phase !== "terminal" || record.notification.state === "acked" || record.notification.state === "dispatching") return null;
 			const digest = terminalEnvelope(record).digest;
 			const claim = record.notification.claim;
@@ -168,30 +212,24 @@ class AskNotifier {
 					claim: this.owner,
 				},
 			};
-			await atomicWriteRecord(this.root, claimed);
 			return claimed;
 		});
 	}
 
 	private async markDispatching(requestId: string, digest: string): Promise<void> {
-		await withRequestLock(this.root, requestId, async () => {
-			const record = await readRequest(this.root, requestId);
-			if (record.notification.state === "acked" || record.notification.digest !== digest) return;
-			await atomicWriteRecord(this.root, {
+		await transactRequest(this.root, requestId, (record) => {
+			if (record.notification.state === "acked" || record.notification.digest !== digest) return null;
+			return {
 				...record,
-				notification: {
-					...record.notification,
-					state: "dispatching",
-				},
-			});
+				notification: { ...record.notification, state: "dispatching" },
+			};
 		});
 	}
 
 	private async markSent(requestId: string, digest: string): Promise<void> {
-		await withRequestLock(this.root, requestId, async () => {
-			const record = await readRequest(this.root, requestId);
-			if (record.notification.state === "acked" || record.notification.digest !== digest) return;
-			await atomicWriteRecord(this.root, {
+		await transactRequest(this.root, requestId, (record) => {
+			if (record.notification.state === "acked" || record.notification.digest !== digest) return null;
+			return {
 				...record,
 				notification: {
 					...record.notification,
@@ -199,15 +237,14 @@ class AskNotifier {
 					sent_at: new Date().toISOString(),
 					attempts: record.notification.attempts + 1,
 				},
-			});
+			};
 		});
 	}
 
 	private async markFailed(requestId: string, digest: string): Promise<void> {
-		await withRequestLock(this.root, requestId, async () => {
-			const record = await readRequest(this.root, requestId);
-			if (record.notification.state === "acked" || record.notification.digest !== digest) return;
-			await atomicWriteRecord(this.root, {
+		await transactRequest(this.root, requestId, (record) => {
+			if (record.notification.state === "acked" || record.notification.digest !== digest) return null;
+			return {
 				...record,
 				notification: {
 					...record.notification,
@@ -215,12 +252,12 @@ class AskNotifier {
 					attempts: record.notification.attempts + 1,
 					claim: null,
 				},
-			});
+			};
 		});
 	}
 }
 
-export function registerAskNotifier(pi: ExtensionAPI, options: AskNotifierOptions = {}): void {
+export function registerAskNotifier(pi: AskNotifierPi, options: AskNotifierOptions = {}): void {
 	const env = options.env ?? process.env;
 	const readIdentity = options.readIdentity ?? readProcessIdentity;
 	const watchFactory = options.watch ?? ((path, listener) => watch(path, listener));
@@ -235,10 +272,10 @@ export function registerAskNotifier(pi: ExtensionAPI, options: AskNotifierOption
 			: null).catch(() => null);
 		if (!owner) return;
 		notifier = new AskNotifier(pi, ctx, root, owner, readIdentity, watchFactory, () => {
-			const message = "Maestri reply notifications could not read or update the request journal. Inspect the original request IDs with maestri_ask_request; do not resend prompts. Notification checks resume on the next event.";
-			if (ctx.hasUI) ctx.ui.notify(message, "warning");
-			else console.error(message);
-		});
+				const message = "Maestri reply notifications could not read or update the request journal. Inspect the original request IDs with maestri_ask_request; do not resend prompts. Notification checks resume on the next event.";
+				if (ctx.hasUI && ctx.ui) ctx.ui.notify(message, "warning");
+				else console.error(message);
+			});
 		notifier.start();
 		await notifier.scan();
 	});
