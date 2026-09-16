@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
+import { isNativeError } from "node:util/types";
 import {
 	link,
 	lstat,
@@ -8,70 +10,37 @@ import {
 	readdir,
 	rename,
 	rm,
-	unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import {
+	parseAskRequestRecord,
+	validateAskRequestRecord,
+	type AskRequestRecord,
+} from "./ask-receipt.ts";
 import { terminalEnvelope } from "./ask-terminal.ts";
+import {
+	sameIdentity,
+	withFileLock,
+} from "./receipt-lock.ts";
+
+export {
+	LegacyLockProtocolError,
+	readProcessIdentity,
+	sameIdentity,
+	withFileLock,
+	type ProcessIdentity,
+} from "./receipt-lock.ts";
+export type { AskRequestRecord } from "./ask-receipt.ts";
 
 export const ASK_RAW_OUTPUT_MAX_BYTES = 1024 * 1024;
 export const ASK_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60_000;
 export const ASK_TERMINAL_RETENTION_COUNT = 200;
 
-export type AskPhase = "accepted" | "running" | "terminal";
-export type AskDelivery = "not-attempted" | "unknown" | "confirmed";
-export type AskReply = "none" | "pending" | "received" | "cancelled" | "unknown";
-export type AskCustody = "none" | "held" | "orphan" | "released";
-export type AskNotificationState = "none" | "pending" | "dispatching" | "sent" | "acked";
-
-export interface ProcessIdentity {
-	start_time: string;
-	cmdline_hex: string;
-}
-
-export interface AskRequestRecord {
-	schema: 1;
-	scope_key: string;
-	runner_token_digest: string;
-	request_id: string;
-	client_request_id: string;
-	agent: string;
-	prompt_digest: string;
-	prompt_bytes: number;
-	created_at: string;
-	phase: AskPhase;
-	delivery: AskDelivery;
-	reply: AskReply;
-	custody: AskCustody;
-	cleanup_deadline_ms: number | null;
-	custody_reason?: string;
-	notification: {
-		state: AskNotificationState;
-		digest: string | null;
-		sent_at: string | null;
-		attempts: number;
-		claim: {
-			pid: number;
-			identity: ProcessIdentity;
-		} | null;
-	};
-	cancel_requested_at?: string;
-	runner?: {
-		pid: number;
-		pgid: number;
-		identity: ProcessIdentity;
-	};
-	terminal?: {
-		reason: string;
-		exit_code: number | null;
-		termination: "abort" | "timeout" | "output-limit" | "process-error" | "launch-unknown" | null;
-		completed_at: string;
-	};
-	output: {
-		raw_bytes: number;
-		truncated: boolean;
-	};
-	state_version: number;
-}
+export type AskPhase = AskRequestRecord["phase"];
+export type AskDelivery = AskRequestRecord["delivery"];
+export type AskReply = AskRequestRecord["reply"];
+export type AskCustody = AskRequestRecord["custody"];
+export type AskNotificationState = AskRequestRecord["notification"]["state"];
 
 export interface AskRequestState {
 	request_id: string;
@@ -96,18 +65,26 @@ export interface AskTerminalTransition {
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
+interface RequestPaths {
+	base: string;
+	root: string;
+}
+
 export class AskRequestNotFoundError extends Error {}
 export class AskRequestRefusalError extends Error {}
 
-function errno(error: unknown, code: string): boolean {
-	return (error as NodeJS.ErrnoException).code === code;
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function errno(error: Error, code: string): boolean {
+	return "code" in error && error.code === code;
 }
 
 function assertPrivateInfo(info: Awaited<ReturnType<typeof lstat>>, target: string, directory: boolean): void {
 	if ((directory && !info.isDirectory()) || (!directory && !info.isFile()) || info.isSymbolicLink()) {
 		throw new Error(`Unsafe async request path: ${target}`);
 	}
-	if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+	const uid = process.getuid?.();
+	if (uid !== undefined && info.uid !== uid) {
 		throw new Error(`Async request path is not owned by the current user: ${target}`);
 	}
 	if ((Number(info.mode) & 0o077) !== 0) {
@@ -121,7 +98,7 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 		assertPrivateInfo(info, directory, true);
 		return;
 	} catch (error) {
-		if (!errno(error, "ENOENT")) throw error;
+		if (!isNativeError(error) || !errno(error, "ENOENT")) throw error;
 	}
 	await mkdir(directory, { recursive: true, mode: 0o700 });
 	assertPrivateInfo(await lstat(directory), directory, true);
@@ -160,43 +137,66 @@ export async function ensureAskStateRoot(env: Environment): Promise<string> {
 	return root;
 }
 
+function lookupPaths(env: Environment): RequestPaths {
+	try {
+		return { base: askStateBase(env), root: askStateRoot(env) };
+	} catch {
+		throw new AskRequestRefusalError("Async request lookup requires a valid workspace and terminal context");
+	}
+}
+
+async function assertLookupBase(base: string): Promise<void> {
+	try {
+		assertPrivateInfo(await lstat(base), base, true);
+	} catch (error) {
+		if (isNativeError(error) && errno(error, "ENOENT")) throw new AskRequestNotFoundError("Async request store does not exist");
+		throw new AskRequestRefusalError("Async request store is unsafe");
+	}
+}
+
+async function assertLookupRegistry(base: string): Promise<string> {
+	const scopes = path.join(base, "scopes");
+	try {
+		assertPrivateInfo(await lstat(scopes), scopes, true);
+		return scopes;
+	} catch (error) {
+		if (isNativeError(error) && errno(error, "ENOENT")) throw new AskRequestNotFoundError("Async request scope registry does not exist");
+		throw new AskRequestRefusalError("Async request scope registry is unsafe");
+	}
+}
+
+async function assertNoLegacyRequest(base: string, requestId: string): Promise<void> {
+	try {
+		if (await exists(path.join(base, `${requestId}.json`))) {
+			throw new AskRequestRefusalError("Refusing an unscoped legacy async request");
+		}
+	} catch (error) {
+		if (error instanceof AskRequestRefusalError) throw error;
+		throw new AskRequestRefusalError("Async request legacy store is unsafe");
+	}
+}
+
 export async function locateRequest(
 	env: Environment,
 	requestId: string,
 ): Promise<{ root: string; record: AskRequestRecord }> {
-	const base = askStateBase(env);
+	const { base, root } = lookupPaths(env);
+	if (!REQUEST_ID_PATTERN.test(requestId)) throw new AskRequestRefusalError("Async request lookup requires a valid request UUID");
+	await assertLookupBase(base);
+	const scopes = await assertLookupRegistry(base);
+	await assertNoLegacyRequest(base, requestId);
 	try {
-		assertPrivateInfo(await lstat(base), base, true);
+		assertPrivateInfo(await lstat(root), root, true);
+		return { root, record: await readRequest(root, requestId) };
 	} catch (error) {
-		if (errno(error, "ENOENT")) throw new AskRequestNotFoundError("Async request store does not exist");
-		throw new AskRequestRefusalError("Async request store is unsafe");
-	}
-	if (await exists(path.join(base, `${requestId}.json`))) {
-		throw new AskRequestRefusalError("Refusing an unscoped legacy async request");
-	}
-	const scopes = path.join(base, "scopes");
-	let names: string[];
-	try {
-		assertPrivateInfo(await lstat(scopes), scopes, true);
-		names = await readdir(scopes);
-	} catch (error) {
-		if (errno(error, "ENOENT")) throw new AskRequestNotFoundError("Async request does not exist");
-		throw new AskRequestRefusalError("Async request scope registry is unsafe");
-	}
-	const matches: Array<{ root: string; record: AskRequestRecord }> = [];
-	for (const name of names) {
-		const root = path.join(scopes, name);
-		if (!(await exists(requestPath(root, requestId)))) continue;
-		try {
-			assertPrivateInfo(await lstat(root), root, true);
-			matches.push({ root, record: await readRequest(root, requestId) });
-		} catch {
-			throw new AskRequestRefusalError("Async request scope or record is unsafe");
+		if (isNativeError(error) && errno(error, "ENOENT")) {
+			if (await foreignRequestExists(scopes, root, requestId)) {
+				throw new AskRequestRefusalError("Refusing an async request from a foreign Maestri scope");
+			}
+			throw new AskRequestNotFoundError("Async request does not exist in this Maestri scope");
 		}
+		throw new AskRequestRefusalError("Async request scope or record is unsafe");
 	}
-	if (matches.length === 0) throw new AskRequestNotFoundError("Async request does not exist");
-	if (matches.length !== 1) throw new AskRequestRefusalError("Async request identity is ambiguous across scopes");
-	return matches[0];
 }
 
 export function promptDigest(prompt: string): string {
@@ -223,6 +223,10 @@ export function clientPath(root: string, digest: string): string {
 	return path.join(root, "by-client", digest);
 }
 
+function prunePath(root: string, requestId: string): string {
+	return path.join(root, `${requestId}.prune`);
+}
+
 async function syncDirectory(directory: string): Promise<void> {
 	const handle = await open(directory, fsConstants.O_RDONLY);
 	try {
@@ -232,7 +236,7 @@ async function syncDirectory(directory: string): Promise<void> {
 	}
 }
 
-async function writeTempJson(target: string, value: unknown): Promise<string> {
+async function writeTempRecord(target: string, record: AskRequestRecord): Promise<string> {
 	const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
 	const handle = await open(
 		temporary,
@@ -240,7 +244,7 @@ async function writeTempJson(target: string, value: unknown): Promise<string> {
 		0o600,
 	);
 	try {
-		await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+		await handle.writeFile(`${JSON.stringify(validateAskRequestRecord(record))}\n`, "utf8");
 		await handle.sync();
 	} finally {
 		await handle.close();
@@ -249,8 +253,9 @@ async function writeTempJson(target: string, value: unknown): Promise<string> {
 }
 
 export async function atomicWriteRecord(root: string, record: AskRequestRecord): Promise<void> {
+	if (record.scope_key !== path.basename(root)) throw new Error("Async request belongs to a foreign scope");
 	const target = requestPath(root, record.request_id);
-	const temporary = await writeTempJson(target, record);
+	const temporary = await writeTempRecord(target, record);
 	try {
 		await rename(temporary, target);
 		await syncDirectory(root);
@@ -260,76 +265,20 @@ export async function atomicWriteRecord(root: string, record: AskRequestRecord):
 	}
 }
 
-function isString(value: unknown): value is string {
-	return typeof value === "string";
-}
-
-function parseRecord(value: unknown): AskRequestRecord {
-	if (!value || typeof value !== "object") throw new Error("Invalid async request record");
-	const source = value as Partial<AskRequestRecord>;
-	const record = {
-		...source,
-		custody: source.custody ?? (source.phase === "terminal" ? "released" : source.phase === "running" ? "held" : "none"),
-		cleanup_deadline_ms: source.cleanup_deadline_ms ?? null,
-		notification: source.notification ?? {
-			state: source.phase === "terminal" ? "pending" : "none",
-			digest: null,
-			sent_at: null,
-			attempts: 0,
-			claim: null,
-		},
-	} as Partial<AskRequestRecord>;
-	if (
-		record.schema !== 1 || !isString(record.scope_key) || !isString(record.runner_token_digest) ||
-		!isString(record.request_id) || !isString(record.client_request_id) ||
-		!isString(record.agent) || !isString(record.prompt_digest) || typeof record.prompt_bytes !== "number" ||
-		!isString(record.created_at) || !["accepted", "running", "terminal"].includes(record.phase ?? "") ||
-		!["not-attempted", "unknown", "confirmed"].includes(record.delivery ?? "") ||
-		!["none", "pending", "received", "cancelled", "unknown"].includes(record.reply ?? "") ||
-		!["none", "held", "orphan", "released"].includes(record.custody ?? "") ||
-		(record.cleanup_deadline_ms !== null && typeof record.cleanup_deadline_ms !== "number") ||
-		(record.custody_reason !== undefined && !isString(record.custody_reason)) ||
-		!record.notification || !["none", "pending", "dispatching", "sent", "acked"].includes(record.notification.state) ||
-		(record.notification.digest !== null && !/^sha256:[0-9a-f]{64}$/.test(record.notification.digest)) ||
-		(record.notification.sent_at !== null && !isString(record.notification.sent_at)) ||
-		!Number.isSafeInteger(record.notification.attempts) || record.notification.attempts < 0 ||
-		(record.cancel_requested_at !== undefined && !isString(record.cancel_requested_at)) ||
-		!record.output || typeof record.output.raw_bytes !== "number" || typeof record.output.truncated !== "boolean" ||
-		typeof record.state_version !== "number"
-	) {
-		throw new Error("Invalid async request record");
-	}
-	if (
-		(record.phase === "terminal" && record.custody !== "released") ||
-		(record.phase === "running" && !["held", "orphan"].includes(record.custody!)) ||
-		(record.phase === "accepted" && !["none", "orphan"].includes(record.custody!))
-	) {
-		throw new Error("Invalid async request custody state");
-	}
-	if (record.notification.claim && (
-		!Number.isSafeInteger(record.notification.claim.pid) || record.notification.claim.pid < 2 ||
-		!isString(record.notification.claim.identity?.start_time) ||
-		!isString(record.notification.claim.identity?.cmdline_hex)
-	)) {
-		throw new Error("Invalid async notification claim");
-	}
-	return record as AskRequestRecord;
-}
-
-async function readPrivateJson(file: string): Promise<unknown> {
+async function readPrivateRecord(file: string): Promise<AskRequestRecord> {
 	const handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
 	try {
 		const info = await handle.stat();
 		assertPrivateInfo(info, file, false);
 		if (info.size > 64 * 1024) throw new Error(`Async request record is too large: ${file}`);
-		return JSON.parse(await handle.readFile("utf8"));
+		return parseAskRequestRecord(await handle.readFile("utf8"));
 	} finally {
 		await handle.close();
 	}
 }
 
 export async function readRequest(root: string, requestId: string): Promise<AskRequestRecord> {
-	const record = parseRecord(await readPrivateJson(requestPath(root, requestId)));
+	const record = await readPrivateRecord(requestPath(root, requestId));
 	if (record.request_id !== requestId) throw new Error("Async request identity mismatch");
 	if (record.scope_key !== path.basename(root)) throw new Error("Async request belongs to a foreign scope");
 	return record;
@@ -337,11 +286,12 @@ export async function readRequest(root: string, requestId: string): Promise<AskR
 
 export async function readClientRequest(root: string, digest: string): Promise<AskRequestRecord | null> {
 	try {
-		const record = parseRecord(await readPrivateJson(clientPath(root, digest)));
+		const record = await readPrivateRecord(clientPath(root, digest));
 		if (record.scope_key !== path.basename(root)) throw new Error("Async request belongs to a foreign scope");
+		if (clientDigest(record.client_request_id) !== digest) throw new Error("Async request client index identity mismatch");
 		return record;
 	} catch (error) {
-		if (errno(error, "ENOENT")) return null;
+		if (isNativeError(error) && errno(error, "ENOENT")) return null;
 		throw error;
 	}
 }
@@ -351,8 +301,24 @@ async function exists(target: string): Promise<boolean> {
 		await lstat(target);
 		return true;
 	} catch (error) {
-		if (errno(error, "ENOENT")) return false;
+		if (isNativeError(error) && errno(error, "ENOENT")) return false;
 		throw error;
+	}
+}
+
+async function foreignRequestExists(scopes: string, localRoot: string, requestId: string): Promise<boolean> {
+	try {
+		for (const name of await readdir(scopes)) {
+			if (name === path.basename(localRoot)) continue;
+			if (!/^[0-9a-f]{64}$/.test(name)) throw new AskRequestRefusalError("Async request scope registry contains an invalid entry");
+			const foreignRoot = path.join(scopes, name);
+			assertPrivateInfo(await lstat(foreignRoot), foreignRoot, true);
+			if (await exists(path.join(foreignRoot, `${requestId}.json`))) return true;
+		}
+		return false;
+	} catch (error) {
+		if (isNativeError(error) && errno(error, "ENOENT")) return false;
+		throw new AskRequestRefusalError("Async request scope registry is unsafe");
 	}
 }
 
@@ -368,18 +334,8 @@ export async function assertRequestInScope(
 		? path.join(base, `${identity.requestId}.json`)
 		: path.join(base, "by-client", identity.clientKeyDigest!);
 	if (await exists(legacy)) throw new Error("Refusing an unscoped legacy async request");
-	if (!identity.requestId) return;
-	const scopes = path.join(base, "scopes");
-	let names: string[] = [];
-	try {
-		names = await readdir(scopes);
-	} catch (error) {
-		if (!errno(error, "ENOENT")) throw error;
-	}
-	for (const name of names) {
-		if (name === path.basename(root)) continue;
-		const foreign = path.join(scopes, name, `${identity.requestId}.json`);
-		if (await exists(foreign)) throw new Error("Refusing an async request from a foreign Maestri scope");
+	if (identity.requestId && await foreignRequestExists(await assertLookupRegistry(base), root, identity.requestId)) {
+		throw new Error("Refusing an async request from a foreign Maestri scope");
 	}
 }
 
@@ -388,13 +344,16 @@ export async function createAcceptedRequest(
 	record: AskRequestRecord,
 	clientKeyDigest: string,
 ): Promise<{ record: AskRequestRecord; created: boolean }> {
+	validateAskRequestRecord(record);
+	if (record.scope_key !== path.basename(root)) throw new Error("Async request belongs to a foreign scope");
+	if (clientKeyDigest !== clientDigest(record.client_request_id)) throw new Error("Async request client index digest mismatch");
 	const target = requestPath(root, record.request_id);
-	const temporary = await writeTempJson(target, record);
+	const temporary = await writeTempRecord(target, record);
 	try {
 		await link(temporary, clientPath(root, clientKeyDigest));
 	} catch (error) {
 		await rm(temporary, { force: true });
-		if (!errno(error, "EEXIST")) throw error;
+		if (!isNativeError(error) || !errno(error, "EEXIST")) throw error;
 		const existing = await readClientRequest(root, clientKeyDigest);
 		if (!existing) throw new Error("Async request client index disappeared");
 		return { record: existing, created: false };
@@ -410,96 +369,98 @@ export async function createAcceptedRequest(
 	}
 }
 
-export async function readProcessIdentity(
-	pid: number,
-): Promise<{ identity: ProcessIdentity; pgid: number } | null> {
-	try {
-		const statText = await open(`/proc/${pid}/stat`, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
-			.then(async (handle) => {
-				try {
-					return await handle.readFile("utf8");
-				} finally {
-					await handle.close();
-				}
-			});
-		const close = statText.lastIndexOf(")");
-		if (close < 0) throw new Error(`Cannot parse process identity for pid ${pid}`);
-		const fields = statText.slice(close + 2).trim().split(/\s+/);
-		if (fields.length < 20) throw new Error(`Cannot parse process identity for pid ${pid}`);
-		const cmdline = await open(`/proc/${pid}/cmdline`, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
-			.then(async (handle) => {
-				try {
-					return await handle.readFile();
-				} finally {
-					await handle.close();
-				}
-			});
-		return {
-			identity: { start_time: fields[19], cmdline_hex: cmdline.toString("hex") },
-			pgid: Number(fields[2]),
-		};
-	} catch (error) {
-		if (errno(error, "ENOENT") || errno(error, "ESRCH")) return null;
-		throw error;
-	}
-}
-
-export function sameIdentity(left: ProcessIdentity, right: ProcessIdentity): boolean {
-	return left.start_time === right.start_time && left.cmdline_hex === right.cmdline_hex;
-}
-
-async function lockOwnerAlive(file: string): Promise<boolean> {
-	try {
-		const owner = await readPrivateJson(file) as { pid?: unknown; identity?: unknown };
-		if (typeof owner.pid !== "number" || !owner.identity || typeof owner.identity !== "object") return true;
-		const current = await readProcessIdentity(owner.pid);
-		return Boolean(current && sameIdentity(current.identity, owner.identity as ProcessIdentity));
-	} catch (error) {
-		if (errno(error, "ENOENT")) return false;
-		return true;
-	}
-}
-
-export async function withFileLock<T>(file: string, operation: () => Promise<T>, timeoutMs = 5_000): Promise<T> {
-	const identity = await readProcessIdentity(process.pid);
-	if (!identity) throw new Error("Cannot establish the current process identity");
-	const token = randomUUID();
-	const deadline = Date.now() + timeoutMs;
-	while (true) {
-		const temporary = await writeTempJson(file, { pid: process.pid, identity: identity.identity, token });
-		try {
-			await link(temporary, file);
-			await rm(temporary, { force: true });
-			break;
-		} catch (error) {
-			await rm(temporary, { force: true });
-			if (!errno(error, "EEXIST")) throw error;
-			if (!(await lockOwnerAlive(file))) {
-				await rm(file, { force: true });
-				continue;
-			}
-			if (Date.now() >= deadline) throw new Error(`Timed out waiting for async request lock: ${file}`);
-			await new Promise((resolve) => setTimeout(resolve, 25));
-		}
-	}
-	try {
-		return await operation();
-	} finally {
-		try {
-			const owner = await readPrivateJson(file) as { token?: unknown };
-			if (owner.token === token) await unlink(file);
-		} catch (error) {
-			if (!errno(error, "ENOENT")) throw error;
-		}
-	}
-}
-
 export async function withRequestLock<T>(
 	root: string,
 	requestId: string,
 	operation: () => Promise<T>,
 ): Promise<T> {
 	return withFileLock(lockPath(root, requestId), operation);
+}
+
+export type AskRequestTransition = (
+	current: Readonly<AskRequestRecord>,
+) => AskRequestRecord | Promise<AskRequestRecord>;
+
+export type AskRequestTransaction = (
+	current: Readonly<AskRequestRecord>,
+) => AskRequestRecord | null | Promise<AskRequestRecord | null>;
+
+function immutableReceiptHeader(record: AskRequestRecord): readonly (number | string)[] {
+	return [
+		record.schema,
+		record.scope_key,
+		record.request_id,
+		record.client_request_id,
+		record.runner_token_digest,
+		record.agent,
+		record.prompt_digest,
+		record.prompt_bytes,
+		record.created_at,
+	];
+}
+
+function terminalFacts(record: AskRequestRecord) {
+	const { notification: _notification, ...facts } = record;
+	return facts;
+}
+
+function notificationStateCanAdvance(current: AskRequestRecord, next: AskRequestRecord): boolean {
+	if (current.notification.state === "acked") return next.notification.state === "acked";
+	return ["pending", "dispatching", "sent", "acked"].includes(next.notification.state);
+}
+
+function validNotificationUpdate(current: AskRequestRecord, next: AskRequestRecord): boolean {
+	const attempts = next.notification.attempts - current.notification.attempts;
+	if (attempts < 0 || attempts > 1) return false;
+	if (next.notification.state === "acked" && next.notification.claim) return false;
+	return notificationStateCanAdvance(current, next);
+}
+
+function validNotificationDigest(current: AskRequestRecord, next: AskRequestRecord): boolean {
+	if (next.notification.digest === current.notification.digest) return true;
+	return next.notification.digest === terminalEnvelope(current).digest;
+}
+
+function isNotificationTransaction(current: AskRequestRecord, next: AskRequestRecord): boolean {
+	if (current.phase !== "terminal" || next.state_version !== current.state_version) return false;
+	if (!validNotificationDigest(current, next)) return false;
+	return validNotificationUpdate(current, next) && isDeepStrictEqual(terminalFacts(current), terminalFacts(next));
+}
+
+export function transactRequest(
+	root: string,
+	requestId: string,
+	transition: AskRequestTransition,
+): Promise<AskRequestRecord>;
+export function transactRequest(
+	root: string,
+	requestId: string,
+	transition: AskRequestTransaction,
+): Promise<AskRequestRecord | null>;
+export async function transactRequest(
+	root: string,
+	requestId: string,
+	transition: AskRequestTransaction,
+): Promise<AskRequestRecord | null> {
+	return withRequestLock(root, requestId, async () => {
+		const current = await readRequest(root, requestId);
+		const proposal = await transition(structuredClone(current));
+		if (proposal === null) return null;
+		const next = validateAskRequestRecord(structuredClone(proposal));
+		if (immutableReceiptHeader(next).some((value, index) => value !== immutableReceiptHeader(current)[index])) {
+			throw new Error("Async request transaction cannot change the immutable receipt header");
+		}
+		if (isNotificationTransaction(current, next)) {
+			await atomicWriteRecord(root, next);
+			return next;
+		}
+		if (current.phase === "terminal") throw new Error("Terminal async request facts are immutable");
+		if (next.state_version !== current.state_version + 1) {
+			throw new Error("Async request transaction must increment state_version exactly once");
+		}
+		await atomicWriteRecord(root, next);
+		return next;
+	});
 }
 
 export function requestState(record: AskRequestRecord): AskRequestState {
@@ -629,7 +590,7 @@ export async function discardOutput(root: string, requestId: string): Promise<vo
 			await handle.close();
 		}
 	} catch (error) {
-		if (!errno(error, "ENOENT")) throw error;
+		if (!isNativeError(error) || !errno(error, "ENOENT")) throw error;
 	}
 }
 
@@ -644,7 +605,7 @@ export async function outputSize(root: string, requestId: string): Promise<numbe
 			await handle.close();
 		}
 	} catch (error) {
-		if (errno(error, "ENOENT")) return 0;
+		if (isNativeError(error) && errno(error, "ENOENT")) return 0;
 		throw error;
 	}
 }
@@ -663,7 +624,7 @@ export async function readOutput(root: string, requestId: string): Promise<Buffe
 			await handle.close();
 		}
 	} catch (error) {
-		if (errno(error, "ENOENT")) return Buffer.alloc(0);
+		if (isNativeError(error) && errno(error, "ENOENT")) return Buffer.alloc(0);
 		throw error;
 	}
 }
@@ -677,20 +638,59 @@ export async function listRequests(root: string): Promise<AskRequestRecord[]> {
 	return records;
 }
 
+async function removePrunedReceipt(root: string, requestId: string): Promise<void> {
+	const tombstone = prunePath(root, requestId);
+	const record = await readPrivateRecord(tombstone);
+	if (record.request_id !== requestId || record.scope_key !== path.basename(root)) {
+		throw new Error("Invalid pruned async request identity");
+	}
+	const digest = clientDigest(record.client_request_id);
+	const indexed = await readClientRequest(root, digest);
+	if (indexed?.request_id === requestId) await rm(clientPath(root, digest), { force: true });
+	await rm(outputPath(root, requestId), { force: true });
+	await syncDirectory(path.join(root, "by-client"));
+	await syncDirectory(root);
+	await rm(tombstone, { force: true });
+	await syncDirectory(root);
+}
+
+async function recoverPrunedReceipts(root: string): Promise<void> {
+	for (const name of await readdir(root)) {
+		if (!/^[0-9a-f-]{36}\.prune$/i.test(name)) continue;
+		const requestId = name.slice(0, -6);
+		await withRequestLock(root, requestId, () => removePrunedReceipt(root, requestId));
+	}
+}
+
+function completedAt(record: AskRequestRecord): number {
+	return Date.parse(record.terminal?.completed_at ?? record.created_at);
+}
+
+async function pruneReceipt(root: string, requestId: string): Promise<void> {
+	return withRequestLock(root, requestId, async () => {
+		let current: AskRequestRecord;
+		try {
+			current = await readRequest(root, requestId);
+		} catch (error) {
+			if (isNativeError(error) && errno(error, "ENOENT")) return;
+			throw error;
+		}
+		if (current.phase !== "terminal") return;
+		await rename(requestPath(root, requestId), prunePath(root, requestId));
+		await syncDirectory(root);
+		await removePrunedReceipt(root, requestId);
+	});
+}
+
 export async function pruneTerminalRequests(root: string, now = Date.now()): Promise<void> {
+	await recoverPrunedReceipts(root);
 	const terminal = (await listRequests(root))
 		.filter((record) => record.phase === "terminal")
-		.sort((left, right) => Date.parse(right.terminal?.completed_at ?? right.created_at) - Date.parse(left.terminal?.completed_at ?? left.created_at));
+		.sort((left, right) => completedAt(right) - completedAt(left));
 	for (let index = 0; index < terminal.length; index += 1) {
 		const record = terminal[index];
-		const completed = Date.parse(record.terminal?.completed_at ?? record.created_at);
+		const completed = completedAt(record);
 		if (index < ASK_TERMINAL_RETENTION_COUNT && now - completed <= ASK_TERMINAL_RETENTION_MS) continue;
-		await withRequestLock(root, record.request_id, async () => {
-			const current = await readRequest(root, record.request_id);
-			if (current.phase !== "terminal") return;
-			await rm(clientPath(root, clientDigest(current.client_request_id)), { force: true });
-			await rm(outputPath(root, current.request_id), { force: true });
-			await rm(requestPath(root, current.request_id), { force: true });
-		});
+		await pruneReceipt(root, record.request_id);
 	}
 }
