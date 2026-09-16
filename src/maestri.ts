@@ -7,11 +7,11 @@ import {
 	DEFAULT_MAX_LINES,
 	formatSize,
 	truncateTail,
-	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { redactSensitiveText } from "./output.ts";
 import { encodeAskPrompt, MAX_PROMPT_BYTES } from "./cli-text.ts";
+import type { PiToolRegistrar } from "./pi-tool.ts";
 export { assertPrompt } from "./cli-text.ts";
 
 export const MAESTRI_LIST_TIMEOUT_MS = 15_000;
@@ -74,6 +74,29 @@ export interface MaestriToolDetails {
 	termination: MaestriExecResult["termination"];
 }
 
+export interface MaestriToolResult {
+	content: [{ type: "text"; text: string }];
+	details: MaestriToolDetails;
+}
+
+export interface FormattedMaestriOutput {
+	body: string;
+	text: string;
+	details: Omit<MaestriToolDetails, "action" | "exitCode" | "killed">;
+}
+
+export interface MaestriOutcome {
+	body: string;
+	result: MaestriToolResult;
+}
+
+export interface MaestriInvokeOptions extends MaestriRuntimeOptions {
+	cwd: string;
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	recovery?: string;
+}
+
 const CLI_ENV_ALLOWLIST = new Set([
 	"HOME",
 	"LANG",
@@ -91,15 +114,15 @@ const CLI_ENV_ALLOWLIST = new Set([
 	"XDG_RUNTIME_DIR",
 ]);
 
-export function maestriCliEnvironment(env: Environment): Record<string, string> {
-	const childEnv: Record<string, string> = {};
+export function maestriCliEnvironment(env: Environment) {
+	const childEnv = new Map<string, string>();
 	for (const [name, value] of Object.entries(env)) {
 		if (value === undefined) continue;
 		if (name.startsWith("MAESTRI_") || name.startsWith("LC_") || CLI_ENV_ALLOWLIST.has(name)) {
-			childEnv[name] = value;
+			childEnv.set(name, value);
 		}
 	}
-	return childEnv;
+	return Object.fromEntries(childEnv);
 }
 
 async function executableFile(candidate: string): Promise<string | null> {
@@ -163,7 +186,7 @@ function processGroupStatus(pid: number | undefined, platform: Platform): "alive
 		process.kill(-pid, 0);
 		return "alive";
 	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "unknown";
+		return error instanceof Error && "code" in error && error.code === "ESRCH" ? "gone" : "unknown";
 	}
 }
 
@@ -330,47 +353,81 @@ function combineOutput(result: MaestriExecResult): string {
 	return sections.join(result.stdout.endsWith("\n") ? "" : "\n");
 }
 
+interface LimitedOutput {
+	body: string;
+	discarded: boolean;
+	truncated: boolean;
+	truncatedBy: "lines" | "bytes" | null;
+	totalLines: number;
+	totalBytes: number;
+	outputLines: number;
+	outputBytes: number;
+}
+
+function limitOutput(result: MaestriExecResult, env: Environment, prefixLines: string[]): LimitedOutput {
+	const discarded = result.termination !== null;
+	const sanitized = discarded ? "" : redactSensitiveText(combineOutput(result), env);
+	const fixedBytes = Buffer.byteLength([...prefixLines, OUTPUT_HEADER].join("\n"), "utf8") + 1;
+	const truncation = truncateTail(sanitized, {
+		maxLines: DEFAULT_MAX_LINES - OUTPUT_RESERVED_LINES - prefixLines.length,
+		maxBytes: DEFAULT_MAX_BYTES - fixedBytes - OUTPUT_NOTICE_RESERVE_BYTES,
+	});
+	return {
+		body: truncation.content,
+		discarded,
+		truncated: truncation.truncated,
+		truncatedBy: truncation.truncatedBy,
+		totalLines: truncation.totalLines,
+		totalBytes: truncation.totalBytes,
+		outputLines: truncation.outputLines,
+		outputBytes: truncation.outputBytes,
+	};
+}
+
+function outputNotice(limited: LimitedOutput): string | null {
+	if (limited.discarded) {
+		return "[OUTPUT OMITTED: the process was terminated, so partial output was discarded]";
+	}
+	if (!limited.truncated) return null;
+	return `[TRUNCATED: showing ${limited.outputLines} of ${limited.totalLines} lines ` +
+		`(${formatSize(limited.outputBytes)} of ${formatSize(limited.totalBytes)}); omitted output was not retained]`;
+}
+
+function outputDetails(
+	limited: LimitedOutput,
+	result: MaestriExecResult,
+): FormattedMaestriOutput["details"] {
+	return {
+		truncated: limited.discarded || limited.truncated,
+		truncatedBy: limited.discarded ? "bytes" : limited.truncatedBy,
+		totalLines: limited.totalLines,
+		totalBytes: Math.max(limited.totalBytes, result.totalOutputBytes),
+		outputLines: limited.outputLines,
+		outputBytes: limited.outputBytes,
+		rawBytesObserved: result.totalOutputBytes,
+		termination: result.termination,
+	};
+}
+
 export function formatMaestriOutput(
 	result: MaestriExecResult,
 	env: Environment = process.env,
 	trustedPrefix?: string,
-): { text: string; details: Omit<MaestriToolDetails, "action" | "exitCode" | "killed"> } {
-	const capturedOutputDiscarded = result.termination !== null;
-	const sanitized = capturedOutputDiscarded ? "" : redactSensitiveText(combineOutput(result), env);
+): FormattedMaestriOutput {
 	const prefix = trustedPrefix ? [trustedPrefix] : [];
-	const fixedBytes = Buffer.byteLength([...prefix, OUTPUT_HEADER].join("\n"), "utf8") + 1;
-	const truncation = truncateTail(sanitized, {
-		maxLines: DEFAULT_MAX_LINES - OUTPUT_RESERVED_LINES - prefix.length,
-		maxBytes: DEFAULT_MAX_BYTES - fixedBytes - OUTPUT_NOTICE_RESERVE_BYTES,
-	});
+	const limited = limitOutput(result, env, prefix);
 	const parts = [...prefix, OUTPUT_HEADER];
-	if (capturedOutputDiscarded) {
-		parts.push(
-			"[OUTPUT OMITTED: the process was terminated, so partial output was discarded]",
-		);
-	} else if (truncation.truncated) {
-		parts.push(
-			`[TRUNCATED: showing ${truncation.outputLines} of ${truncation.totalLines} lines ` +
-				`(${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}); omitted output was not retained]`,
-		);
-	}
-	parts.push(truncation.content || "(no output)");
+	const notice = outputNotice(limited);
+	if (notice) parts.push(notice);
+	parts.push(limited.body || "(no output)");
 	const text = parts.join("\n");
 	if (Buffer.byteLength(text, "utf8") > DEFAULT_MAX_BYTES || text.split("\n").length > DEFAULT_MAX_LINES) {
 		throw new Error("internal output bound invariant failed");
 	}
 	return {
+		body: limited.body,
 		text,
-		details: {
-			truncated: capturedOutputDiscarded || truncation.truncated,
-			truncatedBy: capturedOutputDiscarded ? "bytes" : truncation.truncatedBy,
-			totalLines: truncation.totalLines,
-			totalBytes: Math.max(truncation.totalBytes, result.totalOutputBytes),
-			outputLines: truncation.outputLines,
-			outputBytes: truncation.outputBytes,
-			rawBytesObserved: result.totalOutputBytes,
-			termination: result.termination,
-		},
+		details: outputDetails(limited, result),
 	};
 }
 
@@ -394,68 +451,128 @@ function terminationDescription(
 	}
 }
 
-export async function invokeMaestri(
+function timeoutFor(action: MaestriToolDetails["action"]): number {
+	if (action === "ask") return MAESTRI_ASK_TIMEOUT_MS;
+	return action === "list" ? MAESTRI_LIST_TIMEOUT_MS : MAESTRI_CHECK_TIMEOUT_MS;
+}
+
+function recoveryFor(action: MaestriToolDetails["action"]): string {
+	if (action === "ask") {
+		return " Delivery state is unknown; use maestri_check and do not resend automatically.";
+	}
+	if (action === "role_create") {
+		return " Completion is unknown; use maestri_role_list and maestri_role_show and do not retry automatically.";
+	}
+	if (action === "note_create" || action === "note_edit" || action === "note_stack") {
+		return " Completion is unknown; use maestri_list and maestri_note_read and do not retry automatically.";
+	}
+	return "";
+}
+
+function assertNotCancelled(action: MaestriToolDetails["action"], signal?: AbortSignal): void {
+	if (signal?.aborted) throw new Error(`maestri_${action} was cancelled before execution.`);
+}
+
+async function executeMaestri(
 	action: MaestriToolDetails["action"],
 	args: string[],
-	options: MaestriRuntimeOptions & { cwd: string; signal?: AbortSignal; timeoutMs?: number; recovery?: string },
-) {
-	const { cwd, signal } = options;
-	const env = options.env ?? process.env;
-	const platform = options.platform ?? process.platform;
-	const exec = options.execute ?? runBoundedProcess;
-	const timeout = options.timeoutMs ?? (action === "ask" ? MAESTRI_ASK_TIMEOUT_MS
-		: action === "list" ? MAESTRI_LIST_TIMEOUT_MS : MAESTRI_CHECK_TIMEOUT_MS);
-	const recovery = options.recovery ?? (action === "ask"
-		? " Delivery state is unknown; use maestri_check and do not resend automatically."
-		: action === "role_create"
-			? " Completion is unknown; use maestri_role_list and maestri_role_show and do not retry automatically."
-			: action === "note_create" || action === "note_edit" || action === "note_stack"
-				? " Completion is unknown; use maestri_list and maestri_note_read and do not retry automatically."
-				: "");
-	assertConnected(env, platform);
-	if (signal?.aborted) {
-		throw new Error(`maestri_${action} was cancelled before execution.`);
-	}
-	const executable = await resolveMaestriCli(env, platform);
-	if (signal?.aborted) {
-		throw new Error(`maestri_${action} was cancelled before execution.`);
-	}
-	let result: MaestriExecResult;
+	options: MaestriInvokeOptions,
+	executable: string,
+	timeout: number,
+	recovery: string,
+): Promise<MaestriExecResult> {
 	try {
-		result = await exec(executable, args, {
-			cwd,
-			env: maestriCliEnvironment(env),
-			platform,
-			signal,
+		return await (options.execute ?? runBoundedProcess)(executable, args, {
+			cwd: options.cwd,
+			env: maestriCliEnvironment(options.env ?? process.env),
+			platform: options.platform ?? process.platform,
+			signal: options.signal,
 			timeoutMs: timeout,
 		});
 	} catch {
 		throw new Error(`maestri_${action} could not execute.${recovery}`);
 	}
+}
 
-	if (result.killed || signal?.aborted) {
-		const reason = terminationDescription(result.termination ?? "abort", timeout);
-		throw new Error(formatMaestriOutput(result, env, `maestri_${action} ${reason}.${recovery}`).text);
-	}
-	if (result.code !== 0) {
-		throw new Error(
-			formatMaestriOutput(result, env, `maestri_${action} exited with code ${result.code}.${recovery}`).text,
-		);
-	}
-
-	const formatted = formatMaestriOutput(result, env);
+function discardInterruptedOutput(
+	result: MaestriExecResult,
+	reason: Exclude<MaestriExecResult["termination"], null>,
+): MaestriExecResult {
 	return {
-		content: [{ type: "text" as const, text: formatted.text }],
-		details: {
-			action,
-			exitCode: result.code,
-			killed: result.killed,
-			...formatted.details,
-		} satisfies MaestriToolDetails,
+		...result,
+		stdout: "",
+		stderr: "",
+		killed: true,
+		termination: result.termination ?? reason,
 	};
 }
 
-export function registerMaestriTools(pi: ExtensionAPI, options: MaestriRuntimeOptions = {}): void {
+function assertSuccessfulExecution(
+	action: MaestriToolDetails["action"],
+	result: MaestriExecResult,
+	env: Environment,
+	signal: AbortSignal | undefined,
+	timeout: number,
+	recovery: string,
+): void {
+	if (result.killed || signal?.aborted) {
+		const reason = terminationDescription(result.termination ?? "abort", timeout);
+		const discarded = discardInterruptedOutput(result, result.termination ?? "abort");
+		throw new Error(formatMaestriOutput(discarded, env, `maestri_${action} ${reason}.${recovery}`).text);
+	}
+	if (result.code !== 0) {
+		throw new Error(formatMaestriOutput(
+			result,
+			env,
+			`maestri_${action} exited with code ${result.code}.${recovery}`,
+		).text);
+	}
+}
+
+function toolResult(
+	action: MaestriToolDetails["action"],
+	execution: MaestriExecResult,
+	formatted: FormattedMaestriOutput,
+): MaestriToolResult {
+	return {
+		content: [{ type: "text", text: formatted.text }],
+		details: {
+			action,
+			exitCode: execution.code,
+			killed: execution.killed,
+			...formatted.details,
+		},
+	};
+}
+
+export async function invokeMaestriOutcome(
+	action: MaestriToolDetails["action"],
+	args: string[],
+	options: MaestriInvokeOptions,
+): Promise<MaestriOutcome> {
+	const env = options.env ?? process.env;
+	const platform = options.platform ?? process.platform;
+	const timeout = options.timeoutMs ?? timeoutFor(action);
+	const recovery = options.recovery ?? recoveryFor(action);
+	assertConnected(env, platform);
+	assertNotCancelled(action, options.signal);
+	const executable = await resolveMaestriCli(env, platform);
+	assertNotCancelled(action, options.signal);
+	const execution = await executeMaestri(action, args, options, executable, timeout, recovery);
+	assertSuccessfulExecution(action, execution, env, options.signal, timeout, recovery);
+	const formatted = formatMaestriOutput(execution, env);
+	return { body: formatted.body, result: toolResult(action, execution, formatted) };
+}
+
+export async function invokeMaestri(
+	action: MaestriToolDetails["action"],
+	args: string[],
+	options: MaestriInvokeOptions,
+): Promise<MaestriToolResult> {
+	return (await invokeMaestriOutcome(action, args, options)).result;
+}
+
+export function registerMaestriTools(pi: PiToolRegistrar, options: MaestriRuntimeOptions = {}): void {
 	pi.registerTool({
 		name: "maestri_list",
 		label: "Maestri list",

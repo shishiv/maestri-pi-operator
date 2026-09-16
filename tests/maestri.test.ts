@@ -3,7 +3,6 @@ import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	MAESTRI_ASK_TIMEOUT_MS,
 	MAESTRI_CHECK_TIMEOUT_MS,
@@ -11,23 +10,13 @@ import {
 	type MaestriExecOptions,
 	type MaestriExecResult,
 	formatMaestriOutput,
+	invokeMaestriOutcome,
 	maestriCliEnvironment,
 	registerMaestriTools,
 	resolveMaestriCli,
 	runBoundedProcess,
 } from "../src/maestri.ts";
-
-type RegisteredTool = {
-	name: string;
-	parameters: { additionalProperties?: boolean };
-	execute: (
-		toolCallId: string,
-		params: Record<string, string>,
-		signal: AbortSignal | undefined,
-		onUpdate: undefined,
-		ctx: { cwd: string },
-	) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
-};
+import { createPiToolHarness } from "./support/pi-tools.ts";
 
 type ExecCall = { command: string; args: string[]; options: MaestriExecOptions };
 
@@ -38,6 +27,16 @@ async function fixture(t: TestContext) {
 	await chmod(cli, 0o700);
 	t.after(async () => rm(dir, { recursive: true, force: true }));
 	return { dir, cli };
+}
+
+async function rejection(operation: Promise<object>): Promise<Error> {
+	try {
+		await operation;
+	} catch (error) {
+		assert.ok(error instanceof Error);
+		return error;
+	}
+	throw new Error("expected operation to reject");
 }
 
 function makeHarness(
@@ -52,13 +51,8 @@ function makeHarness(
 	},
 ) {
 	const calls: ExecCall[] = [];
-	const tools = new Map<string, RegisteredTool>();
-	const pi = {
-		registerTool(tool: RegisteredTool) {
-			tools.set(tool.name, tool);
-		},
-	} as unknown as ExtensionAPI;
-	registerMaestriTools(pi, {
+	const harness = createPiToolHarness("/tmp/project");
+	registerMaestriTools(harness.registrar, {
 		env: {
 			PATH: path.dirname(cli),
 			MAESTRI_CLI: cli,
@@ -71,11 +65,7 @@ function makeHarness(
 			return result;
 		},
 	});
-	return { calls, tools };
-}
-
-async function invoke(tool: RegisteredTool, params: Record<string, string>, signal?: AbortSignal) {
-	return tool.execute("call-id", params, signal, undefined, { cwd: "/tmp/project" });
+	return { calls, invoke: harness.invoke };
 }
 
 test("resolves an executable absolute MAESTRI_CLI and falls back to PATH", async (t) => {
@@ -86,6 +76,20 @@ test("resolves an executable absolute MAESTRI_CLI and falls back to PATH", async
 		cli,
 	);
 	await assert.rejects(resolveMaestriCli({ PATH: "" }, "linux"), /CLI is unavailable/);
+});
+
+test("registers exactly the three synchronous transport tools", async (t) => {
+	const { cli } = await fixture(t);
+	const harness = createPiToolHarness("/tmp/project");
+	registerMaestriTools(harness.registrar, {
+		env: {
+			MAESTRI_CLI: cli,
+			MAESTRI_WORKSPACE_ID: "workspace",
+			MAESTRI_SOCKET: "/tmp/socket",
+		},
+		platform: "linux",
+	});
+	assert.deepEqual(harness.registeredNames(), ["maestri_list", "maestri_check", "maestri_ask"]);
 });
 
 test("fails closed on unsupported platforms before resolving or spawning", async (t) => {
@@ -105,9 +109,8 @@ test("fails closed on unsupported platforms before resolving or spawning", async
 test("uses fixed argv, cwd, timeout, and the caller AbortSignal", async (t) => {
 	const { cli } = await fixture(t);
 	const calls: ExecCall[] = [];
-	const tools = new Map<string, RegisteredTool>();
-	const pi = { registerTool(tool: RegisteredTool) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI;
-	registerMaestriTools(pi, {
+	const harness = createPiToolHarness("/tmp/project");
+	registerMaestriTools(harness.registrar, {
 		env: {
 			PATH: path.dirname(cli),
 			MAESTRI_CLI: cli,
@@ -125,9 +128,9 @@ test("uses fixed argv, cwd, timeout, and the caller AbortSignal", async (t) => {
 	const agent = "Agent ; $(touch /tmp/never-executed)";
 	const prompt = "literal $HOME && echo no\nsecond line";
 
-	await invoke(tools.get("maestri_list")!, {}, controller.signal);
-	await invoke(tools.get("maestri_check")!, { agent }, controller.signal);
-	await invoke(tools.get("maestri_ask")!, { agent, prompt }, controller.signal);
+	await harness.invoke("maestri_list", {}, controller.signal);
+	await harness.invoke("maestri_check", { agent }, controller.signal);
+	await harness.invoke("maestri_ask", { agent, prompt }, controller.signal);
 
 	assert.deepEqual(calls.map(({ command }) => command), [cli, cli, cli]);
 	assert.deepEqual(calls.map(({ args }) => args), [
@@ -150,9 +153,9 @@ test("uses fixed argv, cwd, timeout, and the caller AbortSignal", async (t) => {
 
 test("prompt fidelity after controlled CLI escape decoding", async (t) => {
 	const { cli } = await fixture(t);
-	const { calls, tools } = makeHarness(cli);
+	const { calls, invoke } = makeHarness(cli);
 	const prompt = String.raw`C:\tmp\notes literal \n \t \\ \\\\ "quotes" 'single' ` + "`$HOME é 😀\nreal\ttab";
-	await invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt });
+	await invoke("maestri_ask", { agent: "Peer", prompt });
 	// Controlled decoder: n, t and doubled backslash verified against installed CLI /ask HTTP body.
 	const received = calls[0].args[2].replace(/\\([\\nt])/g, (_, escape: string) =>
 		escape === "n" ? "\n" : escape === "t" ? "\t" : "\\");
@@ -161,19 +164,26 @@ test("prompt fidelity after controlled CLI escape decoding", async (t) => {
 
 test("prompt fidelity enforces encoded UTF-8 byte boundary before execution", async (t) => {
 	const { cli } = await fixture(t);
-	const { calls, tools } = makeHarness(cli);
-	const ask = tools.get("maestri_ask")!;
-	await assert.rejects(invoke(ask, { agent: "Peer", prompt: "\\".repeat(32_769) }), /UTF-8 bytes/);
+	const { calls, invoke } = makeHarness(cli);
+	await assert.rejects(invoke("maestri_ask", { agent: "Peer", prompt: "\\".repeat(32_769) }), /UTF-8 bytes/);
 	assert.equal(calls.length, 0);
-	await invoke(ask, { agent: "Peer", prompt: "\\".repeat(32_768) });
+	await invoke("maestri_ask", { agent: "Peer", prompt: "\\".repeat(32_768) });
 	assert.equal(Buffer.byteLength(calls[0].args[2]), 65_536);
 });
 
 test("passes an option-looking prompt in the CLI's post-agent prompt position", async (t) => {
 	const { cli } = await fixture(t);
-	const { calls, tools } = makeHarness(cli);
-	await invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "--raw" });
+	const { calls, invoke } = makeHarness(cli);
+	await invoke("maestri_ask", { agent: "Peer", prompt: "--raw" });
 	assert.deepEqual(calls[0].args, ["ask", "Peer", "--raw"]);
+});
+
+test("test adapter validates registered TypeBox schemas before tool execution", async (t) => {
+	const { cli } = await fixture(t);
+	const { calls, invoke } = makeHarness(cli);
+	await assert.rejects(invoke("maestri_list", { unexpected: "value" }));
+	await assert.rejects(invoke("maestri_check", {}));
+	assert.equal(calls.length, 0);
 });
 
 test("passes only the minimal environment needed by the native CLI", () => {
@@ -207,11 +217,8 @@ test("passes metacharacters to a fake CLI as literal argv without shell executio
 		`#!/usr/bin/env node\nconst fs=require("node:fs");const path=require("node:path");fs.writeFileSync(path.join(path.dirname(process.argv[1]),"argv.json"),JSON.stringify(process.argv.slice(2)));console.log("fake peer response");\n`,
 		{ mode: 0o700 },
 	);
-	const tools = new Map<string, RegisteredTool>();
-	const pi = {
-		registerTool(tool: RegisteredTool) { tools.set(tool.name, tool); },
-	} as unknown as ExtensionAPI;
-	registerMaestriTools(pi, {
+	const harness = createPiToolHarness(dir);
+	registerMaestriTools(harness.registrar, {
 		env: {
 			MAESTRI_CLI: cli,
 			PATH: process.env.PATH,
@@ -222,13 +229,7 @@ test("passes metacharacters to a fake CLI as literal argv without shell executio
 	});
 	const agent = `Agent; touch ${sentinel}`;
 	const prompt = `literal $(touch ${sentinel}) && echo nope`;
-	const result = await tools.get("maestri_ask")!.execute(
-		"call-id",
-		{ agent, prompt },
-		undefined,
-		undefined,
-		{ cwd: dir },
-	);
+	const result = await harness.invoke("maestri_ask", { agent, prompt });
 
 	assert.deepEqual(JSON.parse(await readFile(argvFile, "utf8")), [
 		"ask",
@@ -236,16 +237,19 @@ test("passes metacharacters to a fake CLI as literal argv without shell executio
 		prompt,
 	]);
 	await assert.rejects(access(sentinel));
-	assert.match(result.content[0].text, /^UNTRUSTED PEER OUTPUT/);
+	const first = result.content[0];
+	assert.equal(first?.type, "text");
+	if (!first || first.type !== "text") throw new Error("expected text result");
+	assert.match(first.text, /^UNTRUSTED PEER OUTPUT/);
 });
 
 test("rejects option-like names, NUL, and oversized UTF-8 prompts before exec", async (t) => {
 	const { cli } = await fixture(t);
-	const { calls, tools } = makeHarness(cli);
-	await assert.rejects(invoke(tools.get("maestri_check")!, { agent: "--help" }), /must not start/);
-	await assert.rejects(invoke(tools.get("maestri_check")!, { agent: "bad\0name" }), /no NUL/);
+	const { calls, invoke } = makeHarness(cli);
+	await assert.rejects(invoke("maestri_check", { agent: "--help" }), /must not start/);
+	await assert.rejects(invoke("maestri_check", { agent: "bad\0name" }), /no NUL/);
 	await assert.rejects(
-		invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "é".repeat(32_769) }),
+		invoke("maestri_ask", { agent: "Peer", prompt: "é".repeat(32_769) }),
 		/UTF-8 bytes/,
 	);
 	assert.equal(calls.length, 0);
@@ -254,11 +258,8 @@ test("rejects option-like names, NUL, and oversized UTF-8 prompts before exec", 
 test("refuses execution without the Linux Maestri context", async (t) => {
 	const { cli } = await fixture(t);
 	const calls: ExecCall[] = [];
-	const tools = new Map<string, RegisteredTool>();
-	const pi = {
-		registerTool(tool: RegisteredTool) { tools.set(tool.name, tool); },
-	} as unknown as ExtensionAPI;
-	registerMaestriTools(pi, {
+	const harness = createPiToolHarness("/tmp/project");
+	registerMaestriTools(harness.registrar, {
 		env: { MAESTRI_CLI: cli },
 		platform: "linux",
 		execute: async (command, args, options) => {
@@ -266,7 +267,7 @@ test("refuses execution without the Linux Maestri context", async (t) => {
 			return { stdout: "", stderr: "", code: 0, killed: false, termination: null, totalOutputBytes: 0 };
 		},
 	});
-	await assert.rejects(invoke(tools.get("maestri_list")!, {}), /context is unavailable/);
+	await assert.rejects(harness.invoke("maestri_list", {}), /context is unavailable/);
 	assert.equal(calls.length, 0);
 });
 
@@ -311,8 +312,10 @@ test("labels, redacts, and tail-truncates output without retaining the full resp
 	assert.match(formatted.text, /\[TRUNCATED:/);
 	assert.doesNotMatch(
 		formatted.text,
-		/secret-token-value|private-maestri\.sock|private-workspace-id|private-database|private-google|private-npm|private-azure|private-postgres|private-db|private-mysql|github_pat_|control-hidden|line-one|line-two|unknown-bidi|proxy-password|other-secret|\u001b|\u202e/,
+		/secret-token-value|private-maestri\.sock|private-workspace-id|private-database|private-google|private-npm|private-azure|private-postgres|private-db|private-mysql|github_pat_|control-hidden|line-one|line-two|unknown-bidi|proxy-password|other-secret/,
 	);
+	assert.equal(formatted.text.includes("\u001b"), false);
+	assert.equal(formatted.text.includes("\u202e"), false);
 	assert.ok(Buffer.byteLength(formatted.text, "utf8") <= 50 * 1024);
 	assert.ok(formatted.text.split("\n").length <= 2_000);
 	assert.equal(formatted.details.truncated, true);
@@ -334,20 +337,70 @@ test("normalizes Unicode line separators before enforcing the line cap", () => {
 	assert.ok(formatted.text.split("\n").length <= 2_000);
 });
 
+test("returns a sanitized bounded body separately from public presentation", async (t) => {
+	const { cli } = await fixture(t);
+	const secret = "private-outcome-token";
+	const raw = `${"discarded\n".repeat(2_100)}result-line\nMAESTRI_TOKEN=${secret}\n`;
+	const outcome = await invokeMaestriOutcome("portal", ["portal", "text", "Web"], {
+		cwd: "/tmp/project",
+		env: {
+			MAESTRI_CLI: cli,
+			MAESTRI_WORKSPACE_ID: "workspace",
+			MAESTRI_SOCKET: "/tmp/socket",
+			MAESTRI_TOKEN: secret,
+		},
+		platform: "linux",
+		execute: async () => ({
+			stdout: raw,
+			stderr: "",
+			code: 0,
+			killed: false,
+			termination: null,
+			totalOutputBytes: Buffer.byteLength(raw),
+		}),
+	});
+
+	assert.doesNotMatch(outcome.body, /UNTRUSTED|TRUNCATED|private-outcome-token/);
+	assert.match(outcome.body, /result-line\nMAESTRI_TOKEN=\[REDACTED\]$/);
+	assert.match(outcome.result.content[0].text, /^UNTRUSTED PEER OUTPUT/);
+	assert.match(outcome.result.content[0].text, /\[TRUNCATED:/);
+	assert.equal("body" in outcome.result, false);
+	assert.equal(outcome.result.details.truncated, true);
+	assert.ok(Buffer.byteLength(outcome.body, "utf8") < 50 * 1024);
+	assert.ok(outcome.body.split("\n").length < 2_000);
+});
+
+test("keeps the structured body empty when presentation supplies the no-output placeholder", async (t) => {
+	const { cli } = await fixture(t);
+	const outcome = await invokeMaestriOutcome("list", ["list"], {
+		cwd: "/tmp/project",
+		env: {
+			MAESTRI_CLI: cli,
+			MAESTRI_WORKSPACE_ID: "workspace",
+			MAESTRI_SOCKET: "/tmp/socket",
+		},
+		platform: "linux",
+		execute: async () => ({
+			stdout: "",
+			stderr: "",
+			code: 0,
+			killed: false,
+			termination: null,
+			totalOutputBytes: 0,
+		}),
+	});
+	assert.equal(outcome.body, "");
+	assert.match(outcome.result.content[0].text, /\(no output\)$/);
+});
+
 test("does not spawn the CLI when the AbortSignal is already aborted", async (t) => {
 	const { cli } = await fixture(t);
-	const { calls, tools } = makeHarness(cli);
+	const { calls, invoke } = makeHarness(cli);
 	const controller = new AbortController();
 	controller.abort();
-	await assert.rejects(
-		invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "one request" }, controller.signal),
-		(error: unknown) => {
-			assert.ok(error instanceof Error);
-			assert.match(error.message, /cancelled before execution/);
-			assert.doesNotMatch(error.message, /delivery state is unknown/i);
-			return true;
-		},
-	);
+	const error = await rejection(invoke("maestri_ask", { agent: "Peer", prompt: "one request" }, controller.signal));
+	assert.match(error.message, /cancelled before execution/);
+	assert.doesNotMatch(error.message, /delivery state is unknown/i);
 	assert.equal(calls.length, 0);
 });
 
@@ -504,25 +557,46 @@ test("marks ask timeout or abort as unknown delivery and never retries", async (
 		termination: "timeout",
 		totalOutputBytes: 29,
 	};
-	const { calls, tools } = makeHarness(cli, result);
-	await assert.rejects(
-		invoke(tools.get("maestri_ask")!, { agent: "Peer", prompt: "one request" }),
-		(error: unknown) => {
-			assert.ok(error instanceof Error);
-			assert.match(error.message, /delivery state is unknown; use maestri_check and do not resend automatically/i);
-			assert.doesNotMatch(error.message, /sensitive-partial-payload-xyz/);
-			return true;
-		},
-	);
+	const { calls, invoke } = makeHarness(cli, result);
+	const error = await rejection(invoke("maestri_ask", { agent: "Peer", prompt: "one request" }));
+	assert.match(error.message, /delivery state is unknown; use maestri_check and do not resend automatically/i);
+	assert.doesNotMatch(error.message, /sensitive-partial-payload-xyz/);
 	assert.equal(calls.length, 1);
+});
+
+test("discards captured output when cancellation races with process completion", async (t) => {
+	const { cli } = await fixture(t);
+	const controller = new AbortController();
+	const harness = createPiToolHarness("/tmp/project");
+	registerMaestriTools(harness.registrar, {
+		env: {
+			MAESTRI_CLI: cli,
+			MAESTRI_WORKSPACE_ID: "workspace",
+			MAESTRI_SOCKET: "/tmp/socket",
+		},
+		platform: "linux",
+		execute: async () => {
+			controller.abort();
+			return {
+				stdout: "partial-secret-output",
+				stderr: "",
+				code: 0,
+				killed: false,
+				termination: null,
+				totalOutputBytes: 21,
+			};
+		},
+	});
+	const error = await rejection(harness.invoke("maestri_list", {}, controller.signal));
+	assert.match(error.message, /partial output was discarded/);
+	assert.doesNotMatch(error.message, /partial-secret-output/);
 });
 
 test("sanitizes nonzero CLI diagnostics before throwing", async (t) => {
 	const { cli } = await fixture(t);
 	const token = "do-not-leak-this-token";
-	const tools = new Map<string, RegisteredTool>();
-	const pi = { registerTool(tool: RegisteredTool) { tools.set(tool.name, tool); } } as unknown as ExtensionAPI;
-	registerMaestriTools(pi, {
+	const harness = createPiToolHarness("/tmp/project");
+	registerMaestriTools(harness.registrar, {
 		env: {
 			MAESTRI_CLI: cli,
 			MAESTRI_WORKSPACE_ID: "workspace",
@@ -540,22 +614,16 @@ test("sanitizes nonzero CLI diagnostics before throwing", async (t) => {
 			}),
 	});
 
-	await assert.rejects(
-		invoke(tools.get("maestri_list")!, {}),
-		(error: unknown) => {
-			assert.ok(error instanceof Error);
-			assert.match(error.message, /exited with code 7/);
-			assert.match(error.message, /UNTRUSTED PEER OUTPUT/);
-			assert.doesNotMatch(error.message, /do-not-leak|another-secret/);
-			return true;
-		},
-	);
+	const error = await rejection(harness.invoke("maestri_list", {}));
+	assert.match(error.message, /exited with code 7/);
+	assert.match(error.message, /UNTRUSTED PEER OUTPUT/);
+	assert.doesNotMatch(error.message, /do-not-leak|another-secret/);
 });
 
 test("keeps failed tool output within the model-visible line and byte caps", async (t) => {
 	const { cli } = await fixture(t);
 	const raw = Array.from({ length: 2_500 }, (_, index) => `failure-${index}`).join("\n");
-	const { tools } = makeHarness(cli, {
+	const { invoke } = makeHarness(cli, {
 		stdout: raw,
 		stderr: "",
 		code: 9,
@@ -563,11 +631,8 @@ test("keeps failed tool output within the model-visible line and byte caps", asy
 		termination: null,
 		totalOutputBytes: Buffer.byteLength(raw),
 	});
-	await assert.rejects(invoke(tools.get("maestri_list")!, {}), (error: unknown) => {
-		assert.ok(error instanceof Error);
-		assert.ok(Buffer.byteLength(error.message, "utf8") <= 50 * 1024);
-		assert.ok(error.message.split("\n").length <= 2_000);
-		assert.match(error.message, /UNTRUSTED PEER OUTPUT/);
-		return true;
-	});
+	const error = await rejection(invoke("maestri_list", {}));
+	assert.ok(Buffer.byteLength(error.message, "utf8") <= 50 * 1024);
+	assert.ok(error.message.split("\n").length <= 2_000);
+	assert.match(error.message, /UNTRUSTED PEER OUTPUT/);
 });
