@@ -20,7 +20,7 @@ export interface NotifierContext {
 	ui?: { notify(message: string, level: "warning"): void };
 }
 
-export type NotifierEventName = "session_start" | "agent_end" | "agent_settled" | "session_shutdown";
+export type NotifierEventName = "session_start" | "agent_end" | "session_shutdown";
 export interface NotifierEvent {}
 export type NotifierHandler = (event: NotifierEvent, ctx: NotifierContext) => void | Promise<void>;
 export interface AskNotifierMessage {
@@ -58,6 +58,8 @@ export interface AskNotifierOptions {
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
+const BUSY_WAKE_MS = 250;
+
 function isNotificationCandidate(record: AskRequestRecord): boolean {
 	if (record.phase !== "terminal") return false;
 	return record.notification.state !== "acked" && record.notification.state !== "dispatching";
@@ -74,7 +76,7 @@ class AskNotifier {
 	private readonly watchFactory: NonNullable<AskNotifierOptions["watch"]>;
 	private readonly reportFailure: () => void;
 	private watcher: Pick<FSWatcher, "close"> | null = null;
-	private timer: NodeJS.Timeout | null = null;
+	private timer: NodeJS.Timeout | undefined;
 	private scanning: Promise<void> | null = null;
 	private rescanRequested = false;
 	private stopped = false;
@@ -102,25 +104,37 @@ class AskNotifier {
 		this.watcher = this.watchFactory(this.root, () => this.schedule());
 	}
 
-	schedule(): void {
+	schedule(delayMs = 25): void {
 		if (this.stopped || this.timer) return;
 		this.timer = setTimeout(() => {
-			this.timer = null;
+			this.timer = undefined;
 			void this.scan();
-		}, 25);
+		}, delayMs);
+		this.timer.unref();
 	}
 
 	async scan(): Promise<void> {
-		if (!this.canDispatch()) return;
+		if (this.stopped) return;
+		// agent_end can run before Pi/OMP becomes idle, with no common event after it.
+		// Retain this wake, checking only in-memory idle state until a scan is safe.
+		if (!this.ctx.isIdle()) {
+			this.schedule(BUSY_WAKE_MS);
+			return;
+		}
 		if (this.scanning) {
 			this.rescanRequested = true;
 			return;
 		}
+		clearTimeout(this.timer);
+		this.timer = undefined;
 		let finish = () => {};
 		this.scanning = new Promise<void>((resolve) => { finish = resolve; });
 		try {
 			for (const record of (await listRequests(this.root)).slice(0, 256)) {
-				if (await this.processRecord(record)) return;
+				if (await this.processRecord(record)) {
+					this.schedule(BUSY_WAKE_MS);
+					return;
+				}
 			}
 			this.failureReported = false;
 		} catch {
@@ -140,16 +154,16 @@ class AskNotifier {
 	}
 
 	private async processRecord(record: AskRequestRecord): Promise<boolean> {
-		if (!this.canDispatch()) return true;
 		if (!isNotificationCandidate(record)) return false;
 		const key = `${record.request_id}:${terminalEnvelope(record).digest}`;
 		if (this.attempted.has(key)) return false;
+		if (!this.canDispatch()) return true;
 		const claimed = await this.claim(record.request_id);
 		if (!claimed) return false;
 		// Lock/identity IO can outlive idle or session shutdown. A claim is not a send.
 		if (!this.canDispatch()) return true;
 		const envelope = terminalEnvelope(claimed);
-		await this.markDispatching(claimed.request_id, envelope.digest);
+		if (!(await this.markDispatching(claimed.request_id, envelope.digest))) return false;
 		if (!this.canDispatch()) {
 			await this.markFailed(claimed.request_id, envelope.digest);
 			return true;
@@ -182,8 +196,8 @@ class AskNotifier {
 
 	async stop(): Promise<void> {
 		this.stopped = true;
-		if (this.timer) clearTimeout(this.timer);
-		this.timer = null;
+		clearTimeout(this.timer);
+		this.timer = undefined;
 		this.watcher?.close();
 		this.watcher = null;
 		// A sent notification still needs its durable write before session teardown.
@@ -216,9 +230,11 @@ class AskNotifier {
 		});
 	}
 
-	private async markDispatching(requestId: string, digest: string): Promise<void> {
-		await transactRequest(this.root, requestId, (record) => {
-			if (record.notification.state === "acked" || record.notification.digest !== digest) return null;
+	private markDispatching(requestId: string, digest: string): Promise<AskRequestRecord | null> {
+		return transactRequest(this.root, requestId, (record) => {
+			if (record.notification.state === "acked" || record.notification.state === "dispatching" || record.notification.digest !== digest) return null;
+			const claim = record.notification.claim;
+			if (!claim || claim.pid !== this.owner.pid || !sameIdentity(claim.identity, this.owner.identity)) return null;
 			return {
 				...record,
 				notification: { ...record.notification, state: "dispatching" },
@@ -281,15 +297,12 @@ export function registerAskNotifier(pi: AskNotifierPi, options: AskNotifierOptio
 	});
 
 	pi.on("agent_end", async () => {
-		await notifier?.scan();
-	});
-
-	// agent_end may still be busy while Pi retries, compacts, or drains follow-ups.
-	// settled is the idle edge; scan still checks for a run started by another extension.
-	pi.on("agent_settled", async () => {
+		// Only a lifecycle wake re-arms a rejected synchronous send. Watcher events
+		// and deferred idle checks must never turn a persistent failure into a loop.
 		notifier?.retryFailed();
 		await notifier?.scan();
 	});
+
 
 	pi.on("session_shutdown", async () => {
 		await notifier?.stop();

@@ -4,7 +4,9 @@ import { lstat, open } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { isNativeError } from "node:util/types";
-import { Type, type Static } from "typebox";
+// OMP remaps bare "typebox" to its tool facade; internal schemas must match typebox/value.
+import * as Type from "typebox/type";
+import type { Static } from "typebox/type";
 import { Check } from "typebox/value";
 
 export interface ProcessIdentity {

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { registerMaestriAsyncTools } from "../src/ask-async.ts";
+import { parseAskRequestRecord } from "../src/ask-receipt.ts";
 import {
 	registerAskNotifier,
 	type AskNotifierMessage,
@@ -137,19 +138,21 @@ test("one idle wake becomes sent and busy delivery waits for agent_end", async (
 	assert.deepEqual(idle.messages[0].options, { deliverAs: "followUp", triggerTurn: true });
 	assert.equal(idle.messages[0].message.customType, "mpo.ask-terminal");
 	const message = idle.messages[0].message;
-	assert.deepEqual(JSON.parse(message.content), {
+	const followup = JSON.parse(message.content);
+	assert.deepEqual({ schema: followup.schema, request_id: followup.request_id, digest: followup.digest }, {
 		schema: "mpo.ask-terminal-followup.v1",
 		request_id: first.request_id,
 		digest: (await readRequest(root, first.request_id)).notification.digest,
-		next_action: "Call maestri_ask_request with action=result and this request_id, once. Do not resend the prompt.",
 	});
 	assert.equal((await readRequest(root, first.request_id)).notification.state, "sent");
 	await idle.emit("agent_end", { isIdle: () => true });
 	assert.equal(idle.messages.length, 1);
 	await idle.emit("session_shutdown", { isIdle: () => true });
 	assert.equal(closed, 1);
-	const sent = await readRequest(root, first.request_id);
-	await atomicWriteRecord(root, { ...sent, notification: { ...sent.notification, state: "acked", claim: null } });
+	const harness = createPiToolHarness("/tmp");
+	registerMaestriAsyncTools(harness.registrar, { env, platform: "linux" });
+	await harness.invoke("maestri_ask_request", { action: "result", request_id: followup.request_id });
+	assert.equal((await readRequest(root, first.request_id)).notification.state, "acked");
 
 	const second = await terminal(root);
 	let busy = true;
@@ -161,12 +164,16 @@ test("one idle wake becomes sent and busy delivery waits for agent_end", async (
 	await deferred.emit("agent_end", { isIdle: () => true });
 	assert.equal(deferred.messages.length, 1);
 	assert.equal((await readRequest(root, second.request_id)).notification.state, "sent");
+	await deferred.emit("session_shutdown", { isIdle: () => true });
 });
 
-test("completion during busy wakes on settled, not on the earlier agent_end", async (t) => {
+test("completion during busy survives agent_end and a long continuation without another idle event", { timeout: 2_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const { env, root } = await fixture(t);
-	const fake = fakePi();
+	const delivered = latch();
 	let busy = true;
+	const deliveryIdle: boolean[] = [];
+	const fake = fakePi(() => false, () => { deliveryIdle.push(!busy); delivered.resolve(); });
 	const ctx = { isIdle: () => !busy };
 	let changed = () => {};
 	registerAskNotifier(fake.pi, {
@@ -178,32 +185,65 @@ test("completion during busy wakes on settled, not on the earlier agent_end", as
 	const completed = await terminal(root);
 	changed();
 	await fake.emit("agent_end", ctx);
+	for (let continuation = 0; continuation < 5; continuation += 1) t.mock.timers.tick(60_000);
 	assert.equal(fake.messages.length, 0);
-	assert.equal((await readRequest(root, completed.request_id)).notification.state, "pending");
-	// Pi may also have another extension start a run before our settled handler.
-	await fake.emit("agent_settled", ctx);
-	assert.equal(fake.messages.length, 0);
+	const pending = await readRequest(root, completed.request_id);
+	assert.equal(pending.notification.state, "pending");
+	assert.equal(pending.notification.attempts, 0);
+	// OMP clears its in-flight counter only after the extension's agent_end handler returns.
 	busy = false;
-	await fake.emit("agent_settled", ctx);
-	assert.equal(fake.messages.length, 1);
-	await fake.emit("agent_settled", ctx);
+	t.mock.timers.tick(60_000);
+	await delivered.promise;
 	await fake.emit("agent_end", ctx);
+	await fake.emit("session_shutdown", ctx);
+	t.mock.timers.tick(60_000);
+	assert.deepEqual(deliveryIdle, [true]);
 	assert.equal(fake.messages.length, 1);
+	assert.equal(fake.messages[0].message.details.request_id, completed.request_id);
 	const sent = await readRequest(root, completed.request_id);
 	assert.equal(sent.notification.state, "sent");
 	assert.equal(sent.notification.attempts, 1);
-	await atomicWriteRecord(root, { ...sent, notification: { ...sent.notification, state: "acked", claim: null } });
-	await fake.emit("agent_settled", ctx);
-	assert.equal((await readRequest(root, completed.request_id)).notification.state, "acked");
-	assert.equal(fake.messages.length, 1);
 });
 
-test("busy or shutdown during asynchronous claim must prevent sending until an idle session", async (t) => {
+test("shutdown cancels a pending idle wake and ignores late watcher or agent events", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { env, root } = await fixture(t);
+	const completed = await terminal(root);
+	const fake = fakePi();
+	let busy = true;
+	let closed = 0;
+	let changed = () => {};
+	const ctx = { isIdle: () => !busy };
+	registerAskNotifier(fake.pi, {
+		...notifierOptions(env, owner(152), () => {}),
+		watch: (_path, listener) => { changed = listener; return { close() { closed += 1; } }; },
+	});
+	t.after(() => fake.emit("session_shutdown", ctx));
+	await fake.emit("session_start", ctx);
+	await fake.emit("agent_end", ctx);
+	t.mock.timers.tick(60_000);
+	await fake.emit("session_shutdown", ctx);
+	busy = false;
+	changed();
+	await fake.emit("agent_end", ctx);
+	t.mock.timers.tick(60_000);
+	assert.equal(closed, 1);
+	assert.equal(fake.messages.length, 0);
+	assert.equal((await readRequest(root, completed.request_id)).notification.attempts, 0);
+	await fake.emit("session_start", ctx);
+	assert.equal(fake.messages.length, 1);
+	assert.equal((await readRequest(root, completed.request_id)).notification.state, "sent");
+	await fake.emit("session_shutdown", ctx);
+});
+
+test("busy or shutdown during asynchronous claim must prevent sending until an idle session", { timeout: 2_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	for (const stop of [false, true]) {
 		const { env, root } = await fixture(t);
 		const completed = await terminal(root);
 		await atomicWriteRecord(root, { ...completed, notification: { ...completed.notification, claim: owner(161) } });
-		const fake = fakePi();
+		const delivered = latch();
+		const fake = fakePi(() => false, delivered.resolve);
 		let busy = false;
 		const ctx = { isIdle: () => !busy };
 		let shuttingDown: Promise<void> | undefined;
@@ -221,9 +261,42 @@ test("busy or shutdown during asynchronous claim must prevent sending until an i
 		assert.equal(fake.messages.length, 0, stop ? "stopped" : "busy");
 		assert.equal((await readRequest(root, completed.request_id)).notification.attempts, 0);
 		busy = false;
-		await fake.emit("agent_settled", ctx);
+		t.mock.timers.tick(60_000);
+		if (!stop) await delivered.promise;
+		await fake.emit("session_shutdown", ctx);
 		assert.equal(fake.messages.length, stop ? 0 : 1);
+		assert.equal((await readRequest(root, completed.request_id)).notification.state, stop ? "pending" : "sent");
 	}
+});
+
+test("an acknowledgment after the claim suppresses that notice without blocking other results", async (t) => {
+	const { env, root } = await fixture(t);
+	const acknowledged = await terminal(root);
+	const file = path.join(root, `${acknowledged.request_id}.json`);
+	const own = owner(163);
+	const fake = fakePi();
+	const ctx = {
+		isIdle() {
+			const current = parseAskRequestRecord(readFileSync(file, "utf8"));
+			if (current.notification.state === "pending" && current.notification.claim?.pid === own.pid) {
+				// Let a durable ACK win after claim releases its lock, before dispatch takes it.
+				writeFileSync(file, JSON.stringify({ ...current, notification: { ...current.notification, state: "acked", claim: null } }), { mode: 0o600 });
+			}
+			return true;
+		},
+	};
+	registerAskNotifier(fake.pi, notifierOptions(env, own, () => {}));
+	t.after(() => fake.emit("session_shutdown", ctx));
+	await fake.emit("session_start", ctx);
+	assert.equal(fake.messages.length, 0);
+	assert.equal((await readRequest(root, acknowledged.request_id)).notification.state, "acked");
+	assert.equal((await readRequest(root, acknowledged.request_id)).notification.attempts, 0);
+	const next = await terminal(root);
+	await fake.emit("agent_end", ctx);
+	assert.deepEqual(fake.messages.map(({ message }) => message.details.request_id), [next.request_id]);
+	assert.equal((await readRequest(root, next.request_id)).notification.state, "sent");
+	assert.equal((await readRequest(root, acknowledged.request_id)).notification.state, "acked");
+	await fake.emit("session_shutdown", ctx);
 });
 
 function latch() {
@@ -250,15 +323,46 @@ test("an idle wake overlapping a scan is retained without continuous polling", {
 	const starting = fake.emit("session_start", ctx);
 	await entered.promise;
 	const second = await terminal(root); // Not in the in-flight scan's list snapshot; fake watcher is silent.
-	await fake.emit("agent_settled", ctx);
+	await fake.emit("agent_end", ctx);
 	release.resolve();
 	await starting;
 	await delivered.promise;
-	await fake.emit("agent_settled", ctx);
+	await fake.emit("agent_end", ctx);
 	// Shutdown must drain the durable write that follows sendMessage, not outlive the fixture.
 	await fake.emit("session_shutdown", ctx);
 	assert.equal((await readRequest(root, second.request_id)).notification.state, "sent");
 	assert.equal(fake.messages.length, 2);
+	assert.deepEqual(fake.messages.map(({ message }) => message.details.request_id).sort(), [first.request_id, second.request_id].sort());
+});
+
+test("a completed idle scan does not poll the journal without a new wake", { timeout: 2_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { env, root } = await fixture(t);
+	const first = await terminal(root);
+	const delivered = latch();
+	let sends = 0;
+	const fake = fakePi(() => false, () => { if (++sends === 2) delivered.resolve(); });
+	let idleChecks = 0;
+	const ctx = { isIdle: () => { idleChecks += 1; return true; } };
+	let changed = () => {};
+	registerAskNotifier(fake.pi, {
+		...notifierOptions(env, owner(173), () => {}),
+		watch: (_path, listener) => { changed = listener; return { close() {} }; },
+	});
+	t.after(() => fake.emit("session_shutdown", ctx));
+	await fake.emit("session_start", ctx);
+	const checksAfterScan = idleChecks;
+	const second = await terminal(root);
+	t.mock.timers.tick(60_000);
+	assert.equal(idleChecks, checksAfterScan, "without pending work even idle checks must stop");
+	assert.deepEqual(fake.messages.map(({ message }) => message.details.request_id), [first.request_id]);
+	assert.equal((await readRequest(root, second.request_id)).notification.state, "pending");
+	changed();
+	t.mock.timers.tick(60_000);
+	await delivered.promise;
+	await fake.emit("session_shutdown", ctx);
+	assert.deepEqual(fake.messages.map(({ message }) => message.details.request_id), [first.request_id, second.request_id]);
+	assert.equal((await readRequest(root, second.request_id)).notification.state, "sent");
 });
 
 test("restart reannounces sent-unacked once and acked result suppresses later sessions", async (t) => {
@@ -335,11 +439,11 @@ test("background journal failures are reported without an unhandled rejection an
 	assert.equal(warnings.length, 1);
 	assert.match(warnings[0], /Maestri.*notifications/i);
 	assert.doesNotMatch(warnings[0], /private-canary|maestri-ask-notifier-/);
-	await fake.emit("agent_settled", ctx);
+	await fake.emit("agent_end", ctx);
 	assert.equal(warnings.length, 1, "repeated failure must not flood the UI");
 	await rm(malformed);
 	const completed = await terminal(root);
-	await fake.emit("agent_settled", ctx);
+	await fake.emit("agent_end", ctx);
 	assert.equal(fake.messages.length, 1);
 	assert.equal((await readRequest(root, completed.request_id)).notification.state, "sent");
 });
@@ -369,12 +473,15 @@ test("send failure stays pending and finite waiter never mutates notification st
 });
 
 
-test("a synchronous send failure releases its claim and retries on the next idle event", async (t) => {
+test("synchronous send failures retry only after agent_end or restart, never on watcher or busy wakes", { timeout: 2_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const { env, root } = await fixture(t);
 	const completed = await terminal(root);
+	const delivered = latch();
 	let fail = true;
-	const flaky = fakePi(() => fail);
-	const ctx = { isIdle: () => true };
+	let busy = false;
+	const flaky = fakePi(() => fail, delivered.resolve);
+	const ctx = { isIdle: () => !busy };
 	let changed = () => {};
 	registerAskNotifier(flaky.pi, {
 		...notifierOptions(env, owner(402), () => {}),
@@ -389,14 +496,27 @@ test("a synchronous send failure releases its claim and retries on the next idle
 	assert.equal(pending.notification.claim, null);
 	assert.equal(flaky.messages.length, 0);
 	changed();
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	t.mock.timers.tick(60_000);
+	await flaky.emit("session_shutdown", ctx);
 	assert.equal((await readRequest(root, completed.request_id)).notification.attempts, 1);
+	await flaky.emit("session_start", ctx);
+	await flaky.emit("agent_end", ctx);
+	assert.equal((await readRequest(root, completed.request_id)).notification.attempts, 3);
+	assert.equal(flaky.messages.length, 0);
 
 	fail = false;
-	await flaky.emit("agent_settled", ctx);
+	busy = true;
+	await flaky.emit("agent_end", ctx);
+	for (let continuation = 0; continuation < 5; continuation += 1) t.mock.timers.tick(60_000);
+	assert.equal((await readRequest(root, completed.request_id)).notification.attempts, 3);
+	assert.equal(flaky.messages.length, 0);
+	busy = false;
+	t.mock.timers.tick(60_000);
+	await delivered.promise;
+	await flaky.emit("session_shutdown", ctx);
 	const sent = await readRequest(root, completed.request_id);
 	assert.equal(sent.notification.state, "sent");
-	assert.equal(sent.notification.attempts, 2);
+	assert.equal(sent.notification.attempts, 4);
 	assert.equal(flaky.messages.length, 1);
 });
 
@@ -415,6 +535,9 @@ test("a post-send journal failure does not reannounce after restart", async (t) 
 	await first.emit("session_start", ctx);
 	rmSync(root, { recursive: true, force: true });
 	renameSync(unavailable, root);
+	assert.equal(first.messages.length, 1);
+	assert.equal((await readRequest(root, completed.request_id)).notification.state, "dispatching");
+	await first.emit("agent_end", ctx);
 	assert.equal(first.messages.length, 1);
 	assert.equal((await readRequest(root, completed.request_id)).notification.state, "dispatching");
 

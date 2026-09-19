@@ -21,6 +21,7 @@ role bootstraps or automatic team setup.
 ## Install
 
 Requires **Linux**, **Node.js 24+**, and **Pi running in a Maestri terminal**.
+For OMP, use the unreleased compatibility instructions below.
 
 Before upgrading from the JSON-file lock protocol, drain or stop every old
 Pi/runner that can write to the store. Mixed-version writers are unsupported;
@@ -51,6 +52,33 @@ app/installer change, not an install or removal performed by this package.
 Android control additionally requires an Android SDK and an available emulator
 or a phone authorized for USB debugging. The extension does not install or
 configure them.
+
+### OMP compatibility (unreleased)
+
+This checkout includes fixes for **OMP 18.2.6** that are **not present in the
+published npm 0.4.0**. Do not use that published version for OMP async requests.
+OMP accepts the same `pi.extensions` manifest, but loading the package alone
+does not verify its internal validators or notification lifecycle.
+
+To evaluate this checkout without changing OMP's installed plugins:
+
+```sh
+npm ci
+npm run build
+omp --no-extensions -e /absolute/path/to/maestri-pi-operator/dist/index.js
+```
+
+Run OMP inside a Maestri terminal, with Node.js available on `PATH` for the
+separate async runner. TypeBox is a required peer (`^1.3.7`); the locked
+development install provides it for this command.
+
+OMP can host the tools, but an async **destination must still be an idle,
+supported Pi**. OMP as a destination is not certified by these host checks.
+A live round trip passed with the corrected local tarball: an OMP 18.2.6 RPC
+caller sent one async request through Maestri to Pi 0.85.1, received the native
+follow-up and read the result once, leaving its receipt acknowledged. Both
+agents used Azure GPT-6 Astra. Revalidate when changing host versions or your
+Maestri setup; this does not certify OMP as a destination or portal journeys.
 
 > **Historical validation evidence:** a review for Maestri 0.16.0 recorded
 > transport tests and model-backed smoke passing, and real web DOM, forms, click,
@@ -116,10 +144,15 @@ Use a stable `client_request_id`. The same key, agent and prompt return the
 original request; a changed payload is rejected. Pending results never expose
 partial replies.
 
-When a request finishes, Pi receives an `mpo.ask-terminal` follow-up with the
+When a request finishes, the Pi or OMP caller receives an `mpo.ask-terminal` follow-up with the
 next action. Reading `result` is the Pi acknowledgement. A restart may
 reannounce an unacknowledged result once. Firstmate acknowledgement is a
 separate external concern.
+
+Notices wait until the caller is idle, even when `agent_end` arrives while it
+is still busy. A synchronous notice-send failure stays pending until another
+`agent_end` or a new session; file changes and idle checks never authorize a
+retry by themselves. This does not resend the underlying request.
 
 - The destination must be an idle, supported Pi, with no other active async ask.
 - Requests are private to the Maestri workspace and calling terminal.
@@ -222,6 +255,17 @@ tarball installed into isolated `node_modules`.
 `npm pack` builds the distributable automatically. `smoke` uses **GPT-6 Astra**
 against a controlled CLI and requires model access; it is not a live Maestri
 journey.
+
+The internal-validation regression also runs against an installed OMP loader
+when Bun is available and its package root is supplied:
+
+```sh
+MPO_OMP_PACKAGE_ROOT=/absolute/path/to/node_modules/@oh-my-pi/pi-coding-agent npm run check
+```
+
+It checks the same receipt, lock and invocation cases in source and built
+artifacts under Node and OMP. Without this variable, the OMP-specific case is
+explicitly skipped; the Node cases still run. These checks do not call a model.
 
 Smoke events, per-call argv and the first failure are retained under
 `.artifacts/smoke-v01/` (override with `MPO_SMOKE_ARTIFACTS_DIR`). The deterministic

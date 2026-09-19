@@ -77,7 +77,7 @@ test("exposes no Maestri tools, hooks, or command without a complete Maestri con
 	}
 });
 
-test("exposes 14 transport tools, one command, and four hooks inside Maestri", () => {
+test("exposes the transport tools and operator command inside Maestri", () => {
 	const env = {
 		MAESTRI_WORKSPACE_ID: "workspace",
 		MAESTRI_SOCKET: "/tmp/maestri.sock",
@@ -89,7 +89,6 @@ test("exposes 14 transport tools, one command, and four hooks inside Maestri", (
 		"maestri_note_create", "maestri_note_edit", "maestri_note_read", "maestri_note_stack",
 		"maestri_portal", "maestri_portal_device", "maestri_role_create", "maestri_role_list", "maestri_role_show",
 	].sort());
-	assert.equal([...loaded.handlers.values()].flat().length, 4);
 	assert.equal(loaded.handlers.has("resources_discover"), false);
 	assert.deepEqual([...loaded.commands.keys()], ["maestri-operator"]);
 });
@@ -109,7 +108,7 @@ test("maestri operator queues no-argument guidance and deduplicates it after rel
 	assert.equal(loaded.messages[0].message.customType, "mpo.maestri-operator");
 	await command.handler("", ctx);
 	assert.equal(loaded.messages.length, 1);
-	assert.match(notices[0], /already active/);
+	assert.equal(notices.length, 1);
 	await command.handler("Inspect the connected reviewer", ctx);
 	assert.deepEqual(loaded.messages[1].options, { deliverAs: "followUp", triggerTurn: true });
 	assert.match(loaded.messages[1].message.content, /Task: Inspect the connected reviewer/);

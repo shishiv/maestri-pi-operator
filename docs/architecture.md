@@ -1,6 +1,6 @@
-# Arquitetura do transporte Maestri para Pi
+# Arquitetura do transporte Maestri para Pi e OMP
 
-A extensão transporta chamadas tipadas entre Pi e o CLI nativo do Maestri.
+A extensão transporta chamadas tipadas entre Pi ou OMP e o CLI nativo do Maestri.
 O Maestri continua responsável pelo canvas, pelas conexões, pelas permissões
 e pelo ciclo de vida dos terminais. Skills, playbooks, princípios, bootstraps
 e montagem automática do canvas ficam fora deste pacote.
@@ -20,8 +20,9 @@ ativa, remove ou migra.
 
 A fonte permanece em TypeScript e MJS. `scripts/build.mjs` gera `dist/` limpo
 com o compilador local, reescrevendo imports relativos para JavaScript. O pacote
-distribui essa saída, incluindo declarações de tipos, e o Pi carrega `dist/index.js`.
-O runner e o executável externo não dependem do loader TypeScript do Pi.
+distribui essa saída, incluindo declarações de tipos, e Pi/OMP carregam `dist/index.js`
+pelo mesmo manifesto `pi.extensions`. O runner e o executável externo não dependem
+do loader TypeScript do host.
 `bin/mpo-extension` conserva o caminho público e carrega `dist/extension-cli.mjs`,
 gerado de `src/extension-cli.mjs`. Não há transpiler adicional em runtime.
 
@@ -29,6 +30,13 @@ gerado de `src/extension-cli.mjs`. Não há transpiler adicional em runtime.
 Não interpreta listagens para planejar efeitos. Não gera páginas nem mantém
 manifests, bindings, versões ou um journal de mutações. Cada chamada executa
 um comando e devolve o resultado do Maestri.
+
+Os schemas de parâmetros usam o import público `typebox`, que o OMP adapta
+à sua fronteira de tools. Schemas internos de Recibo, lock e invocação usam
+`typebox/type`, junto de `Check` de `typebox/value`: construtor e validador
+permanecem da mesma implementação, sem misturar a facade do host com TypeBox
+real. O peer aceita TypeBox 1.x a partir de 1.3.7. O runner continua em processo
+Node separado, fora do remapeamento do OMP. Isso não muda o formato persistido.
 
 Roles são criadas somente no workspace atual. As tools não expõem escopo
 global, atribuição de roles, edição de prompts existentes ou exclusão.
@@ -140,18 +148,23 @@ texto parcial.
 ## Notificações e integração externa
 
 `src/ask-notifier.ts` observa o journal do escopo e envia um follow-up quando
-Pi está ocioso. O registro guarda a notificação e seu claim de processo.
+o chamador Pi/OMP está ocioso. O registro guarda a notificação e seu claim de processo.
 O aviso inclui a orientação de ler `result` daquele pedido uma vez, sem reenvio,
 para permitir a retomada mesmo em uma sessão sem briefing anterior.
-Um claim estrangeiro vivo impede outro envio. Antes de chamar `sendMessage`, o
-estado `dispatching` é persistido; se a gravação posterior falhar, restart não
-reenvia um aviso cuja entrega ficou incerta. Falha síncrona de envio volta a
-`pending`, libera o claim e só é reavaliada na próxima borda idle. Ler result
-faz o ack.
+Um claim estrangeiro vivo impede outro envio. A transação que arma `dispatching`
+confere o dono do claim e não arma o envio se o Reconhecimento Pi já venceu essa corrida.
+Antes de chamar `sendMessage`, o estado `dispatching` é persistido; se a gravação
+posterior falhar, restart não reenvia um aviso cuja entrega ficou incerta.
+Falha síncrona de envio volta a `pending`, libera o claim e só é reavaliada após
+outro `agent_end` ou numa nova sessão. Ler result faz o ack.
 
-O notifier reavalia também em `agent_settled`, porque `agent_end` pode ainda
-ocorrer durante busy. Reconfere idle após IO, coalesce eventos sobrepostos e
-aguarda gravações em andamento no shutdown. Não há polling contínuo do modelo.
+O notifier usa somente `session_start`, `agent_end` e `session_shutdown`, comuns
+a Pi e OMP. Como `agent_end` pode ocorrer durante busy, conserva o wake pendente
+e consulta apenas `ctx.isIdle()` a cada 250 ms até poder fazer o scan: não lê o
+journal enquanto o chamador está ocupado. Depois de consumir os wakes, para de
+consultar. Reconfere idle após IO, coalesce eventos sobrepostos e cancela o timer
+no shutdown, aguardando as gravações em andamento. Eventos de arquivo e ticks
+não reabrem tentativas de envio que falharam; não há dependência de `agent_settled`.
 
 Falhas de leitura ou gravação durante o scan em segundo plano são contidas e
 geram um aviso genérico na UI ou stderr, sem conteúdo do journal. O aviso não se
@@ -188,6 +201,21 @@ checkout. A criação do recibo e o CLI são controlados; isso não substitui um
 o mesmo pacote instalado. Os testes locais não substituem jornadas Pi/Maestri,
 web ou Android reais; quando o ambiente ou as fixtures não estiverem disponíveis,
 a evidência deve ser registrada como **BLOCKED**, não como PASS.
+
+`tests/omp-validation.test.ts` usa os mesmos casos de Recibo, lock e invocação
+em Node e no loader real do OMP, tanto para fonte quanto para `dist`. A parte
+OMP exige Bun e `MPO_OMP_PACKAGE_ROOT`; sem esse caminho, registra skip explícito.
+Os testes do notifier reproduzem busy após `agent_end`, retorno a idle sem novo
+evento, shutdown, retry limitado e Reconhecimento Pi concorrente com relógio
+controlado. Suporte ao host OMP não certifica OMP como destinatário de Pedido async.
+
+Uma prova ao vivo do tarball local corrigido completou OMP 18.2.6 em RPC →
+Maestri → Pi 0.85.1, ambos com Azure GPT-6 Astra. Houve um Pedido async, um Aviso
+Pi nativo e uma leitura de result pelo modelo chamador. O Recibo terminou com
+`delivery=confirmed`, `reply=received`, `custody=released` e `notification=acked`,
+com uma tentativa de aviso. O chamador encerrou com código 0. Essa prova não
+certifica OMP como destinatário nem jornadas web/Android; a evidência sanitizada
+fica nos artefatos locais da verificação, sem credenciais nem captura integral.
 
 O build compila e valida em staging antes de substituir `dist`, com rollback
 se a publicação falhar; não promete troca atômica sem janela para leitores.

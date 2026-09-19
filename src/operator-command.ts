@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+// OMP remaps bare "typebox" to its tool facade; internal schemas must match typebox/value.
+import * as Type from "typebox/type";
 import { Check } from "typebox/value";
 
 const CUSTOM_TYPE = "mpo.maestri-operator";

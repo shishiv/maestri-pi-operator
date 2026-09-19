@@ -1,4 +1,6 @@
-import { Type, type Static } from "typebox";
+// OMP remaps bare "typebox" to its tool facade; internal schemas must match typebox/value.
+import * as Type from "typebox/type";
+import type { Static } from "typebox/type";
 import { Check } from "typebox/value";
 
 const PhaseSchema = Type.Union([Type.Literal("accepted"), Type.Literal("running"), Type.Literal("terminal")]);
