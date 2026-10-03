@@ -54,7 +54,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.84.4",
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@oxlint/plugins": "1.81.0",
     "@types/node": "^24.0.0",
     "oxlint": "1.81.0",
